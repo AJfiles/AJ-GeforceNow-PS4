@@ -1,353 +1,319 @@
 # AJ GeForce NOW para PS4
 
-Cliente **GeForce NOW** nativo para **PlayStation 4** (homebrew, firmware 9.00, GoldHEN).
-No es un navegador ni un envoltorio web: implementa el protocolo completo del servicio.
+Cliente de GeForce NOW para PS4, homebrew. No es un navegador ni una web metida en un envoltorio: hace
+el recorrido entero del servicio por su cuenta.
 
-**Versión: 4.32** · PKG incluido en [`build/`](build/)
+Versión 4.32. El PKG está en `build/`, listo para instalar.
 
----
+## Qué hace
 
-## Qué es
-
-Un cliente que corre **en la propia consola** y hace todo el recorrido del servicio:
+Arranca, te logueas escaneando un QR, navegas el catálogo y cuando le das a jugar se conecta al servidor
+de NVIDIA y te trae el vídeo a la consola. Todo el camino:
 
 ```
-Login (OAuth por QR)  →  Catálogo  →  Cola de sesión (CloudMatch)
-    →  Señalización WebSocket + SDP  →  WebRTC (libpeer)
-    →  Stream de vídeo H.264  →  Decodificación FFmpeg  →  Presentación por libSceVideoOut
+Login (OAuth por QR) → Catálogo → Cola de sesión (CloudMatch)
+    → Señalización WebSocket + SDP → WebRTC (libpeer)
+    → Stream H.264 → FFmpeg lo decodifica → libSceVideoOut lo presenta
 ```
 
-**El vídeo no se reescala en la CPU.** El frame llega a **720p nativo** y se presenta **1:1** en un
-framebuffer de **1280x720**; el estirón al panel de 1080p lo hace **el hardware de `libSceVideoOut`**.
-Ese detalle es el que separa los **20 fps** de los **60 fps** (ver *Rendimiento*, más abajo).
+El detalle que importa para que vaya fino: **el vídeo no se reescala en la CPU**. El frame llega a 720p
+y se presenta tal cual en un framebuffer de 1280x720. El estirón hasta el panel de 1080p lo hace el
+hardware de la consola. Eso es lo que separa ir a 20 fps de ir a 60, y costó bastante darse cuenta.
 
----
+## Cómo va
 
-## Estado real
+Esto está medido en consola, no estimado:
 
-Medido en consola, no estimado.
-
-### Funciona
-
-| Función | Evidencia medida |
+| | |
 |---|---|
-| Instalación, login por QR, catálogo, biblioteca, cola | `pkg_validate` **28/28** |
-| **Stream de vídeo a 720p nativo** | **3543 frames presentados en 57,0 s = 62,2 fps** |
-| **Presentación directa 1:1** | `1280x720 → 1280x720` en las 3543 filas; **`scaled=0`**, **`reused=0`** |
-| **Presupuesto de frame** | **`pres_us` mediana 1221 µs sobre 16666** (7 %); solo **12 filas** con `over=1` |
-| Arranque | **`APP_READY` a los 7 ms** |
-| Audio Opus, mando a 125 Hz | `drops=0` |
-| Red | `gaps=0`, `rtp_drops=0` |
-| Memoria | 4608 MB constantes durante 12,9 h (sin fuga) |
-| Colores | Lienzo `BGR888` + rotación R↔B en la copia (verificado con 6 pruebas) |
+| Frames presentados | **3543 en 57 segundos = 62,2 fps** |
+| Conversión | 1280x720 → 1280x720, sin escalar en ningún frame |
+| Coste de presentar un frame | **1221 µs de media**, sobre un presupuesto de 16666 |
+| Frames que se pasan del presupuesto | **12 de 3543** (un 0,3 %) |
+| Arranque | bucle listo a los 7 ms |
+| Audio y mando | sin pérdidas, mando a 125 Hz |
+| Red | sin huecos ni paquetes perdidos |
+| Memoria | 4608 MB constantes durante 12,9 horas |
 
-### Lo que falla, y conviene saberlo antes de instalarlo
+El decodificador produce unos 64 fps y del servidor llegan unas 65 unidades por segundo, así que se
+presenta el 96 % de lo que entra. No hay ningún cuello de botella.
 
-**1. El decodificador por hardware de PS4 no está disponible.**
-`libSceVideodec2` no carga en este firmware (`rc=0x805A1000`) y la librería de arbitración no tiene
-firmas verificadas. **La decodificación es por software**, y va sobrada: **108-118 µs por lote**.
-No es un cuello de botella.
+## Lo que no funciona
 
-**2. El servidor puede bajar la resolución a 960x540 aunque se pidan 720p.**
-Se ha medido (`tex=1280x720 x15 → tex=960x540 x205`) incluso **con el viewport declarado a 1080p**, que
-es la palanca que en la v3.15 lo evitaba. **No se puede corregir del todo desde el cliente.**
-Y hay un círculo vicioso: al bajar la resolución el coste del cliente **no baja** si se está escalando
-a 1080p, así que el servidor no ve mejoría y no la recupera. **La ruta directa rompe ese círculo**
+**El decodificador por hardware no se puede usar.** `libSceVideodec2` no carga en el firmware que
+tenemos (`rc=0x805A1000`) y la librería de arbitración no tiene firmas verificadas. Así que se decodifica
+por software. Da igual, porque va sobrado: 108-118 µs por lote.
+
+**El servidor a veces baja la resolución a 960x540 aunque le pidas 720p.** Lo hemos medido: empezó
+entregando 720p y a mitad de sesión se pasó a 540p. Eso se nota en que la imagen pierde nitidez y
+aparece pixelación, y desde el cliente no se puede arreglar, porque el detalle que no llegó no se puede
+inventar. Hemos probado de todo para evitarlo: viewport 1080p en el SDP (que es lo que funcionaba en la
+v3.15), REMB a 50 Mbps, modo de calidad Original, scalingFeature1 y el prefiltro del servidor. Ninguno
+lo elimina del todo.
+
+Hay además un círculo vicioso con esto. Si el servidor baja la resolución y tú estabas escalando a
+1080p, tu coste no baja, así que él no ve mejoría y no la recupera. La ruta directa rompe ese círculo,
 porque su framebuffer se adapta al stream.
 
-**3. La ruta SDL (respaldo) no puede llegar a 60 fps, y no es optimizable.**
-El driver de SDL-PS4 fija el lienzo **al tamaño del display (1920x1080)** y copia a VideoOut con un
-`memcpy` crudo sin escalar. Por tanto **un stream de 720p se escala a 1080p en la CPU**: ~31.000 µs
-sobre un presupuesto de 16.666. **Techo estructural de ~20 fps.**
+**La ruta SDL, que es el respaldo, no puede llegar a 60 fps.** No es que esté mal optimizada: el driver
+de SDL-PS4 fija el lienzo al tamaño del panel (1920x1080) y copia a VideoOut con un memcpy sin escalar,
+así que un stream de 720p se tiene que escalar a 1080p en la CPU. Eso son unos 31000 µs sobre un
+presupuesto de 16666. El techo está en unos 20 fps y no hay forma de bajarlo.
 
-**4. Cierres esporádicos sin causa identificada.**
-Las sesiones han terminado a los 31, 42, 178, 214, 233, 269, 325, 497, 515, 603, 1037 y 3570 segundos:
-**no hay un umbral fijo**, así que no es un watchdog del sistema ni un límite de tiempo. Están
-descartados con medidas la memoria (plana durante 240 s), la red, el decodificador y la cola.
-Dos causas **sí** se identificaron y corrigieron: dibujar con `renderer = NULL` (v4.20) y el callback
-de presentación quedando fuera de alcance (v4.24).
+**Hay cierres esporádicos que no hemos conseguido explicar.** Las sesiones se han terminado a los 31,
+42, 178, 214, 233, 269, 325, 497, 515, 603, 1037 y 3570 segundos. No hay un patrón de tiempo, así que
+no es el sistema matando la app ni un límite de nada. Descartamos con medidas la memoria (plana durante
+240 segundos), la red, el decodificador y la cola. Dos causas sí las pillamos y están corregidas:
+dibujar con `renderer = NULL` y que el callback de presentación se quedara fuera de alcance.
 
-### Lo que no se pudo implementar
+## Lo que no pudimos hacer
 
-| Función | Por qué |
-|---|---|
-| **Decodificación por hardware** (`libSceVideodec2`) | el módulo no carga en firmware 9.00 (`0x805A1000`); la ABI v1 responde `0x80C10001` en `query_resource_info` |
-| **1080p** | el único intento cerró la app: **1 flip con 1080p frente a 119 con 720p**. Además, sobre un panel 1080p un framebuffer de 720p **se estira y llena la pantalla**, así que 1080p solo añadiría 4× más píxeles que escribir |
-| **Garantizar que el servidor no baje a 540p** | se probaron viewport 1080p en el SDP, REMB a 50 Mbps, calidad `Original`, `scalingFeature1` y prefiltro del servidor: **ninguno lo elimina del todo** |
-| **Escalador de hardware de VideoOut** | `sceVideoOutSubmitFlip` no acepta un rectángulo de origen: **no se le puede pedir que escale a un tamaño concreto**, solo se aprovecha el estirado del framebuffer al panel |
-| **Vídeo a 60 fps garantizados** | depende de que la ruta directa no se caiga; hay un vigilante que **degrada a SDL sola** si deja de presentar, y eso baja a ~20 fps en vez de congelar la imagen |
+**Decodificación por hardware.** El módulo no carga en este firmware y la ABI v1 responde `0x80C10001`
+en `query_resource_info`. Sin firmas verificadas no hay forma segura de usarla.
 
----
+**1080p.** Se intentó y la app se cerró. Los números: 1 flip presentado con framebuffer de 1080p frente
+a 119 con 720p. Además, sobre un panel de 1080p un framebuffer de 720p ya se estira y llena la pantalla,
+así que 1080p solo te haría escribir cuatro veces más píxeles a cambio de nada. Desde la v4.22 hay un
+techo en `Initialize()` que hace imposible registrarlo, para que no vuelva a pasar por accidente.
 
-## Rendimiento: por qué 720p y por qué directo
+**Evitar el 540p.** Ver arriba: cinco intentos, ninguno funcionó.
 
-| | **Ruta SDL** | **Ruta directa** |
-|---|---|---|
-| Destino | 1920x1080 (el display) | **1280x720** (el stream) |
-| Escalado de un stream 720p | **en la CPU**, ~31.000 µs | **ninguno** (conversión 1:1) |
-| Quién estira al panel | la CPU | **libSceVideoOut**, en hardware |
-| **Fps medidos** | ~20 | **62,2** |
+**Pedirle a VideoOut que escale a un tamaño concreto.** `sceVideoOutSubmitFlip` no acepta un rectángulo
+de origen, así que no se le puede decir "esto a 960x540 estíralo a 1080p". Lo único que se aprovecha es
+que el framebuffer se estira al panel.
 
-**La misma imagen se puede producir escalando en la CPU (20 fps) o en el hardware de VideoOut (60 fps).**
-
-**Medición real de una sesión (de `trace_stream.csv`):**
-
-```
-3543 frames en 57,0 s          = 62,2 fps
-over=1  (pasa de 16.666 µs)    = 12 de 3543   (0,3 %)
-scaled=1 (escalado en CPU)     = 0
-reused=1 (cola vacía)          = 0
-pres_us: min 1159 · mediana 1221 · max 16987
-```
-
-El decodificador produce **~64 fps** y el servidor envía **~65 unidades/s**: se presenta el **96 %** de
-lo que llega. **No hay cuello de botella en ningún sitio.**
-
----
+**Garantizar los 60 fps siempre.** Depende de que la ruta directa no se caiga. Hay un vigilante que, si
+deja de presentar, degrada a SDL sola en vez de dejarte la imagen congelada, pero eso te baja a ~20 fps.
+Es mejor que una foto fija, pero no es lo que quieres.
 
 ## Requisitos
 
-| Elemento | Requisito |
+| | |
 |---|---|
-| Consola | PS4 Pro validada; Fat y Slim sin probar |
-| Firmware | **9.00** |
+| Consola | PS4 Pro es donde se ha probado. Fat y Slim deberían ir igual |
 | Jailbreak | **GoldHEN** |
+| Firmware | **Cualquiera que GoldHEN soporte.** Solo hemos probado en 9.00 |
 | Cuenta | GeForce NOW (Free, Priority o Ultimate) |
-| Red | Cable recomendado |
-| Mando | DualShock 4; teclado y ratón USB opcionales |
+| Red | Cable mejor que WiFi |
+| Mando | DualShock 4. Teclado y ratón USB opcionales |
 
-No requiere PSN.
+Sobre el firmware: no lo hemos probado en todas las versiones, así que no vamos a jurar que funcione en
+todas. Pero la app no hace nada específico de una versión concreta, solo usa las librerías normales del
+sistema (VideoOut, AudioOut, Videodec, Pad), y esas no cambian entre firmwares. Si tienes GoldHEN
+funcionando, lo normal es que arranque. Si pruebas en otra versión y falla, el `diagnostic.log` lo dirá.
 
----
+No hace falta PSN.
 
 ## Instalación
 
 1. Copia `build/IV0000-GFNP00001_00-GFNPS4CLIENT0001.pkg` a un USB (exFAT o FAT32).
-2. En la PS4: **GoldHEN → Package Installer**.
-3. Instala. Aparecerá **AJ GeForce NOW** en el menú.
+2. En la PS4, con GoldHEN activo: **Package Installer**.
+3. Instala y aparecerá **AJ GeForce NOW** en el menú.
 
-> **Title ID: `GFNP00001`.** Es el único que la consola acepta tras muchas pruebas.
+El Title ID es `GFNP00001`. Es el único que la consola aceptaba después de muchas pruebas.
 
----
+## Cómo se usa
 
-## Uso
-
-1. Abre la app y acepta el aviso beta.
-2. **Iniciar sesión** → aparece un **código QR**. Escanéalo y autoriza en tu cuenta de NVIDIA.
+1. Abres la app y aceptas el aviso beta.
+2. Le das a **Iniciar sesión** y sale un QR. Lo escaneas, autorizas en tu cuenta de NVIDIA y ya está.
    Solo hay que hacerlo una vez.
-3. Navega el catálogo, elige un juego y espera la cola.
-4. En la partida: mando de PS4 a 125 Hz. El menú de la app se abre con PS/Options.
+3. Navegas el catálogo, eliges juego y esperas la cola.
+4. Cuando entras, el mando va a 125 Hz. El menú de la app se abre con PS/Options.
 
-| Botón | Acción |
+| Botón | Qué hace |
 |---|---|
 | X | Confirmar |
 | Círculo | Volver |
-| Arriba/Abajo | Navegar |
-| Izquierda/Derecha | Cambiar el valor del ajuste |
+| Arriba/Abajo | Moverte por el menú |
+| Izquierda/Derecha | Cambiar el valor de un ajuste |
 
----
+## Ajustes
 
-## Configuración (13 filas)
+Son 13 filas. Las que importan:
 
 | # | Ajuste | Notas |
 |---|---|---|
 | 0 | Idioma | |
 | 1 | Dispositivo de entrada | Auto / Mando / Teclado |
-| 2 | **Resolución (solo 720P)** | La única que controla framebuffer y petición |
-| 3 | FPS de transmisión | 30 / 60 |
+| 2 | Resolución | Solo 720p. Es la que decide framebuffer y petición |
+| 3 | FPS de transmisión | 30 o 60 |
 | 4 | Límite de bitrate | 25 / 30 / 35 Mbps |
 | 5 | Modo de calidad | Original / Clarity / Adaptive |
 | 6 | Buffer de audio | 20-80 ms |
 | 7 | Idioma del juego | 8 idiomas |
-| 8 | Decodificador | **Informativo**: `NO DISPONIBLE (SW)` |
-| 9 | Resolución de vídeo | **Informativo**: `720P (FIJO, 1080P DESCARTADO)` |
-| 10 | Realce de nitidez | Cuesta ×3,9 en CPU; desactivado por defecto |
+| 8 | Decodificador | Informativo: `NO DISPONIBLE (SW)` |
+| 9 | Resolución de vídeo | Informativo: `720P (FIJO, 1080P DESCARTADO)` |
+| 10 | Realce de nitidez | Cuesta ×3,9 en CPU. Desactivado por defecto |
 | 11 | Región | |
 | 12 | Guardar y volver | |
 
-**¿Por qué 1080p está bloqueado?** El único intento de sesión que cerró la aplicación tenía framebuffer
-1920x1080: **1 flip presentado con 1080p frente a 119 con 720p**. Desde la v4.22 hay un **techo explícito**
-en `Initialize()` que hace imposible registrar un framebuffer de 1080p.
+El 1080p está bloqueado por lo que contaba arriba: el único intento cerró la app. Si quieres entender
+por qué, mira la sección de lo que no pudimos hacer.
 
----
+## Los registros
 
-## Diagnóstico
+Todo se guarda en `/data/gfnps4/`.
 
-Todo se escribe en `/data/gfnps4/`.
+Desde la v4.25 hay una traza detallada que sirve para responder a "¿por qué no van a 60 fps?". Son tres
+ficheros:
 
-### Traza detallada (v4.25)
-
-**Una fila por frame y un hito por paso**, para responder "¿dónde se va el presupuesto de 16.666 µs?":
-
-| Fichero | Contenido |
+| Fichero | Qué tiene |
 |---|---|
-| `trace_boot.txt` | **Un hito por cada paso del arranque**, con su tiempo. `APP_READY` es el tiempo real hasta tener bucle |
-| `trace_stream.txt` | Hitos de la sesión + resumen por segundo (`loop_fps`, `draw_ms`, `q`, `dec_fps`, `presentados`) |
-| `trace_stream.csv` | **UNA FILA POR FRAME PRESENTADO** |
+| `trace_boot.txt` | Un renglón por cada paso del arranque, con su tiempo. El de `APP_READY` es lo que tarda en estar lista |
+| `trace_stream.txt` | Los hitos de la sesión y un resumen por segundo |
+| `trace_stream.csv` | **Una fila por frame presentado** |
 
-**Columnas del CSV y qué responde cada una:**
+El CSV es el útil. Cada fila tiene:
 
-| Columna | Qué dice |
+| Columna | Qué te dice |
 |---|---|
 | `t_ms`, `frame`, `gen` | cuándo, qué frame, y su generación |
-| **`reused`** | **1 = la cola estaba vacía** (no es problema de presentación) |
-| `src_w/h`, `dst_w/h` | lo que entregó el servidor y el tamaño real del framebuffer |
-| **`scaled`** | **1 = escalado en CPU** (el enemigo de los 60 fps) |
-| `q`, `dec_fps` | profundidad de cola del decodificador y su caudal |
-| **`pres_us`** | **lo que costó presentar** |
-| `budget_us`, **`over`** | 16666, y **1 si se pasó** |
+| `reused` | 1 = la cola estaba vacía, o sea que no es problema de presentación |
+| `src_w/h`, `dst_w/h` | lo que mandó el servidor y el tamaño real del framebuffer |
+| `scaled` | 1 = se escaló en CPU, que es lo que mata los 60 fps |
+| `q`, `dec_fps` | cola del decodificador y su caudal |
+| `pres_us` | lo que costó presentar ese frame |
+| `budget_us`, `over` | 16666, y 1 si se pasó |
 
-**Con eso, "por qué no van a 60" se lee directamente:** se cuentan las filas con `over=1`, y se mira si
-`scaled=1` o `pres_us` lo explican.
+Con eso, si algo va mal se cuenta cuántas filas tienen `over=1` y se mira si es por `scaled` o por
+`pres_us`. No hay que adivinar nada.
 
-### Log unificado
+Luego está el log de siempre:
 
-| Fichero | Contenido |
+| Fichero | Qué tiene |
 |---|---|
-| `diagnostic.log` | Log completo de la sesión |
-| `last_stage.txt` | Etapa en la que estaba la app en el último latido (1/s) |
-| `session_frames.csv` | Anillo de los últimos 4096 frames presentados |
+| `diagnostic.log` | El log completo de la sesión |
+| `last_stage.txt` | En qué parte del código estaba la app en el último latido (uno por segundo) |
+| `session_frames.csv` | Los últimos 4096 frames presentados |
 | `session_summary.txt` | Resumen: frames, cambios de resolución, tamaños de paquete |
-| `settings.cfg` | Configuración (14 campos) |
+| `settings.cfg` | La configuración |
 
-**Eventos clave:**
+Y las marcas que merece la pena buscar:
 
 ```
 APP_START version=4.32
 VIDEOOUT_HANDOFF_COMPLETE mode=direct_hardware_60fps
 VIDEOOUT_PRESENT_PATH path=direct_1to1 resolution=1280x720
-VIDEOOUT_SIZE_CAPPED_720P ...                    <- el techo actuando
-VIDEOOUT_PRESENT_GATE presentar=N cola_vacia=N   <- la puerta de presentacion
-VIDEOOUT_PRESENT_WATCHDOG ...                    <- el vigilante: degrado a SDL
-VIDEOOUT_RECOVERY_FROM_MAIN_LOOP ...             <- recuperacion desde el bucle
+VIDEOOUT_SIZE_CAPPED_720P ...                    <- el techo de 720p actuando
+VIDEOOUT_PRESENT_GATE presentar=N cola_vacia=N   <- la puerta de presentación
+VIDEOOUT_PRESENT_WATCHDOG ...                    <- el vigilante degradando a SDL
+VIDEOOUT_RECOVERY_FROM_MAIN_LOOP ...             <- la recuperación desde el bucle
 ```
-
----
 
 ## Compilar
 
-**Requisitos del entorno de compilación** (no incluidos en el repositorio, se descargan aparte):
+El repo no trae las herramientas: son más de 3 GB y cada una tiene su licencia. Hay que conseguirlas:
 
-| Herramienta | Uso |
+| Herramienta | Para qué |
 |---|---|
-| **OpenOrbis PS4 Toolchain** | compilador y enlazador para PS4 (`clang`, `ld`, `link.x`) |
-| **LLVM-MinGW** | `make`, `ar` y utilidades POSIX para Windows |
-| **CMake 3.31** | configuración del cliente GFN |
-| **PortableGit** | shell POSIX que exige el `configure` de FFmpeg |
-| **.NET** | `PkgTool.Core.exe` para construir y validar el PKG |
+| OpenOrbis PS4 Toolchain | El compilador y el enlazador de PS4 (`clang`, `ld`, `link.x`) |
+| LLVM-MinGW | `make`, `ar` y utilidades POSIX para Windows |
+| CMake 3.31 | Configurar el cliente |
+| PortableGit | El shell POSIX que pide el `configure` de FFmpeg |
+| .NET | `PkgTool.Core.exe`, para construir y validar el PKG |
 
-Se esperan en `tools/` (esa carpeta está en `.gitignore` por tamaño). El proyecto tiene scripts que
-construyen las dependencias nativas desde `src/third_party/`.
+Van en `tools/`, que está en el `.gitignore`. Luego:
 
 ```powershell
 . .\scripts\ps4-env.ps1        # prepara el entorno
-.\scripts\build-ps4.ps1        # compila el PKG completo + auditorias
+.\scripts\build-ps4.ps1        # compila el PKG y pasa las auditorías
 ```
 
-Salida: `build/ps4/IV0000-GFNP00001_00-GFNPS4CLIENT0001.pkg`
+El resultado sale en `build/ps4/IV0000-GFNP00001_00-GFNPS4CLIENT0001.pkg`.
 
-**El build ejecuta las auditorías y falla si alguna no pasa:**
+El build pasa estas comprobaciones y falla si alguna no cuadra:
 
-| Script | Comprueba |
+| Script | Qué comprueba |
 |---|---|
-| `scripts/audit-build.ps1` | **50 comprobaciones** sobre el binario y el fuente |
-| `scripts/audit-navigation.ps1` | navegación del menú |
-| `scripts/audit-translations.ps1` | coherencia de idiomas |
-| `scripts/audit-settings-layout.ps1` | geometría de las filas y solapes |
-| `scripts/run-host-tests.ps1` | **60 comprobaciones en 5 programas** de host |
-| `PkgTool.Core.exe pkg_validate` | **28/28** sobre el PKG |
+| `scripts/audit-build.ps1` | 50 comprobaciones sobre el binario y el código |
+| `scripts/audit-navigation.ps1` | la navegación del menú |
+| `scripts/audit-translations.ps1` | que los idiomas cuadren |
+| `scripts/audit-settings-layout.ps1` | la geometría de las filas |
+| `scripts/run-host-tests.ps1` | 60 comprobaciones en 5 programas que corren en el PC |
+| `PkgTool.Core.exe pkg_validate` | 28/28 sobre el PKG |
 
-**Nota:** las auditorías no son decorativas. Varias nacieron de fallos reales, y **tres veces en este
-proyecto una comprobación no era capaz de fallar** — se detectó probando cada una con una mutación.
-Si añades una, **pruébala rompiendo a propósito lo que vigila.**
+Un aviso sobre las auditorías: no son de adorno, varias salieron de fallos reales. Y **tres veces en este
+proyecto una comprobación no era capaz de fallar**, y nos dimos cuenta probándolas rompiendo a propósito
+lo que vigilaban. Si añades una, haz lo mismo: rómpelo y mira si salta.
 
----
-
-## Estructura del proyecto
+## Cómo está organizado
 
 ```
 src/
-  ps4/main.cpp            La aplicacion completa (UI, bucle, estado)
+  ps4/main.cpp            La aplicación entera (interfaz, bucle, estado)
   opennow/
-    gfn/                  Cliente del servicio (auth, catalogo, sesion, persistencia)
-    webrtc/               Sesion WebRTC, SDP, senalizacion, entrada
-    stream/               Video: decodificador, conversores SSE2, presentacion
-      PS4VideoOutRenderer.cpp   <- la ruta directa (la que da 60 fps)
-      SDLVideoRenderer.cpp      <- la ruta SDL (respaldo)
-      color_simd.cpp            <- conversion YUV->RGB y escalado en SSE2
-    trace_detail.cpp      Traza detallada de arranque y sesion
-    session_recorder.cpp  Anillo de frames presentados
-  third_party/            Dependencias (ver abajo)
-scripts/                  Build y auditorias
-tests/                    Pruebas de host (se compilan en el PC, no en la consola)
+    gfn/                  El cliente del servicio: login, catálogo, sesión, persistencia
+    webrtc/               La sesión WebRTC, SDP, señalización, entrada
+    stream/               El vídeo
+      PS4VideoOutRenderer.cpp   <- la ruta directa, la que da 60 fps
+      SDLVideoRenderer.cpp      <- la ruta SDL, el respaldo
+      color_simd.cpp            <- conversión YUV y escalado en SSE2
+    trace_detail.cpp      La traza detallada
+    session_recorder.cpp  El anillo de frames
+  third_party/            Las dependencias
+scripts/                  Build y auditorías
+tests/                    Pruebas que corren en el PC, no en la consola
 cmake/                    Toolchain de CMake para PS4
-assets/                   Fuentes e imagenes de la interfaz
-patch/                    Parches y notas de investigacion puntual
-build/                    El PKG compilado
+assets/                   Fuentes e imágenes
+build/                    El PKG
 ```
 
-### Dependencias incluidas (`src/third_party/`)
+Las dependencias que van incluidas en `src/third_party/`:
 
-| Dependencia | Uso | Licencia |
+| Dependencia | Para qué | Licencia |
 |---|---|---|
-| **FFmpeg** | decodificación H.264 software (`libavcodec` + `libavutil`) | LGPL/GPL según build |
-| **libpeer** | WebRTC: ICE, DTLS, SRTP, SCTP | MIT |
-| **Opus** | audio del stream | BSD |
-| **cJSON / jansson** | JSON del protocolo | MIT |
-| **opengnm** | reimplementación de referencia | ver su LICENSE |
+| FFmpeg | Decodificar H.264 por software (solo `libavcodec` y `libavutil`) | LGPL/GPL según el build |
+| libpeer | El WebRTC: ICE, DTLS, SRTP, SCTP | MIT |
+| Opus | El audio | BSD |
+| cJSON, jansson | El JSON del protocolo | MIT |
+| opengnm | Una implementación de referencia | mira su LICENSE |
 
-**Compilar FFmpeg** usa `--disable-everything` con solo `h264`, `mjpeg` y `png` como decodificadores.
+FFmpeg se compila con `--disable-everything` y solo con `h264`, `mjpeg` y `png`.
 
----
+## Cosas de terceros que miramos
 
-## Proyectos de referencia estudiados (no incluidos)
+Estos no van en el repo, son cientos de MB y traen licencias GPL que arrastrarían obligaciones. Los
+teníamos solo para leer:
 
-| Proyecto | Aporte |
+| Proyecto | Qué sacamos |
 |---|---|
-| **OpenNOW** | implementación de referencia del protocolo NVST; FSR1 completo (MIT) |
-| **prosper** | ABI verificada de `libSceVideodec2`; implementación de `videoout_present` |
-| **shadPS4** | reimplementación de las librerías de PS4 — de aquí salió la traducción de `A8B8G8R8` a `RGBA8` que resolvió el orden de canales |
-| **SDL-PS4** | driver de vídeo de PS4 para SDL2 — de aquí salió la cadena de color del driver |
+| OpenNOW | La implementación de referencia del protocolo NVST |
+| prosper | La ABI de `libSceVideodec2` y cómo se hace `videoout_present` |
+| shadPS4 | De aquí salió que `A8B8G8R8` es en realidad `RGBA8`, que fue lo que resolvió el orden de canales |
+| SDL-PS4 | El driver de vídeo de PS4 para SDL2, de donde salió la cadena de color |
 
-No se incluyen en el repositorio: son cientos de MB y traen **sus propias licencias** (GPL), que
-arrastrarían obligaciones a este proyecto.
+## Notas para quien siga con esto
 
----
+Estas son las cosas que nos costaron caro. Están también comentadas en el código, donde toca.
 
-## Notas de ingeniería, para quien continúe
+**La cadena de color tiene tres eslabones y tienen que coincidir los tres.** El driver declara la
+ventana como `BGR888`, pero en SDL eso significa `PACKEDORDER_XBGR`, o sea memoria `[R][G][B]`. Y
+VideoOut está registrado como `A8B8G8R8`, que el emulador traduce a `RGBA8`. Por eso el lienzo es
+`BGR888` y el conversor SSE2 escribe `[B][G][R][A]`. El nombre del formato de VideoOut se lee al revés,
+y eso despista mucho.
 
-Estas son las lecciones que costaron más caro, y están documentadas en el código:
+**`SDL_RenderCopy` no copia, convierte.** Lo cambiamos por un memcpy pensando que los bytes ya estaban
+bien y salieron los colores cambiados. La copia tiene que deshacer el intercambio de rojo y azul.
 
-1. **La cadena de color tiene tres eslabones y los tres tienen que coincidir.** El driver declara la
-   ventana como `BGR888`, pero en SDL eso es `PACKEDORDER_XBGR`: **memoria `[R][G][B]`**. Y VideoOut
-   está registrado como `A8B8G8R8`, que el emulador traduce a `RGBA8`. Por eso el lienzo es `BGR888`
-   y el conversor SSE2 escribe `[B][G][R][A]` — el nombre del formato de VideoOut **se lee al revés**.
+**En el blit el formato importa tanto como el tamaño.** `SDL_LowerBlitScaled` solo usa el camino rápido
+cuando los formatos de origen y destino coinciden. Si no, convierte píxel a píxel, y eso son 20 ns por
+píxel medidos. Se arregló copiando por filas, no cambiando formatos.
 
-2. **`SDL_RenderCopy` no copia: CONVIERTE.** Sustituirlo por un `memcpy` "porque los bytes ya están
-   bien" produjo colores alterados. La copia tiene que **deshacer el intercambio R↔B**.
+**El decodificador no es el cuello de botella, aunque el log lo parezca.** La diferencia entre
+`decoded` y `presented` es el número más llamativo de todo el log y lleva a culpar al decodificador.
+Es justo al revés: entran 87,5 unidades por segundo y salen 87,5. Si `presented` va por debajo, el frame
+se pierde al presentarlo.
 
-3. **En el blit, el formato importa tanto como el tamaño.** `SDL_LowerBlitScaled` solo usa su camino
-   rápido cuando los formatos de origen y destino **coinciden**; si no, convierte píxel a píxel
-   (**20 ns/px**, medido). Se arregló **copiando por filas**, no cambiando formatos.
+**Una guarda que arregla una cosa puede romper otra.** Envolvimos el bloque del stream en un `if` para
+no dibujar con `renderer = NULL`, y eso arregló un cierre pero congeló la imagen, porque dentro de ese
+bloque también vive `Present()`. El propio código ya avisaba: "este bloque hace dos cosas distintas y no
+se pueden tratar como una sola". Lo teníamos escrito y aun así caímos.
 
-4. **El decodificador no es el cuello de botella, aunque el log lo parezca.** La diferencia
-   `decoded - presented` es el número más llamativo del log y lleva a culpar al decodificador:
-   **es lo contrario**. Entran 87,5 u/s y salen 87,5 f/s. Si `presented` va por debajo, **el frame se
-   pierde en la presentación.**
-
-5. **Una guarda que protege una cosa puede romper otra.** Envolver el bloque del stream en un `if`
-   para no dibujar con `renderer = NULL` arregló un cierre **y congeló la imagen**, porque dentro de ese
-   bloque también vive `Present()`. **El propio código ya avisaba: "este bloque hace dos cosas
-   distintas y no se pueden tratar como una sola".**
-
-6. **La presentación no puede depender de un contador que otra rama reescriba.** La puerta comparaba
-   una generación que el camino de fallo marcaba como presentada **sin haber presentado**: un solo
-   frame fallido detenía la presentación **para siempre**.
-
----
+**La presentación no puede depender de un contador que otra rama reescriba.** La puerta comparaba una
+generación que el camino de fallo marcaba como presentada sin haberla presentado. Con eso, un solo frame
+que fallara detenía la presentación para siempre.
 
 ## Licencia y créditos
 
-Proyecto **homebrew** sin relación con NVIDIA ni Sony.
-Herramientas: **OpenOrbis**, **FFmpeg**, **libpeer**, **SDL2**, **Borealis**.
-FSR es de **AMD** (MIT). Licencia del código propio: **MIT** (ver [`LICENSE`](LICENSE)).
+Proyecto homebrew, sin relación con NVIDIA ni con Sony. El código propio es MIT, mira `LICENSE`.
+Herramientas: OpenOrbis, FFmpeg, libpeer, SDL2, Borealis. FSR es de AMD y también es MIT.
