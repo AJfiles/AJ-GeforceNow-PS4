@@ -14,7 +14,7 @@ $objDir = Join-Path $build 'obj'
 $nativeDist = Join-Path $root 'build\libpeer-ps4\dist'
 $gfnArchive = Join-Path $root 'build\gfn-client-ps4\libgfn_client_ps4.a'
 $peerArchive = Join-Path $root 'build\libpeer-ps4\src\libpeer.a'
-$appVersion = '4.32'  # bump on every build
+$appVersion = '4.39'  # bump on every build
 $titleId = 'GFNP00001'
 $contentId = 'IV0000-GFNP00001_00-GFNPS4CLIENT0001'
 # Sony permite letras Y digitos en el Title ID (A-Z0-9), 9 caracteres. La validacion

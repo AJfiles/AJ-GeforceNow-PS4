@@ -415,16 +415,22 @@ if (Test-Path $mainCpp) {
             $tableCount = ([regex]::Matches($tableMatch.Groups['body'].Value, '"[A-Z_]+"')).Count
         }
 
-        # Ultimo valor de las etapas de dibujado. Se miran DOS convenciones de nombre porque el enum de
-        # `main.cpp` usa `STAGE_DRAW_*` y el de `SDLVideoRenderer.cpp` (que no puede incluir el enum,
-        # por ser multiplataforma) usa `kStageVideo*`. Los dos escriben en la misma tabla de nombres.
+        # Ultimo valor de las etapas. Se mira CUALQUIER constante `STAGE_*` y las `kStageVideo*` del
+        # renderizador de video (que no puede incluir el enum, por ser multiplataforma). Los dos
+        # escriben en la misma tabla de nombres.
+        #
+        # OJO CON LA REGEX: antes era `(?:STAGE_DRAW_[A-Z_]+|kStageVideo[A-Za-z]+)`, y al anadir en la
+        # v4.34 las etapas `STAGE_SDL_COPY_BEGIN = 26` y `STAGE_SDL_UPDATE_WINDOW = 27`, **la
+        # comprobacion no las veia**: seguia calculando un maximo de 25 y fallaba diciendo que la tabla
+        # tenia entradas de mas. El fallo lo detecto la propia comprobacion (bien), pero por el motivo
+        # equivocado. Ahora acepta cualquier `STAGE_`, para que anadir una etapa nueva no la deje ciega.
         $lastStage = -1
         # Las marcas del renderer de video viven en su propio fichero (no puede incluir el enum).
         $videoSrc = '' 
         $videoPath = Join-Path $root 'src\opennow\stream\SDLVideoRenderer.cpp'
         if (Test-Path -LiteralPath $videoPath) { $videoSrc = [System.IO.File]::ReadAllText($videoPath) }
         $stageSrc = $mainSrc + "`n" + $videoSrc
-        foreach ($m in [regex]::Matches($stageSrc, '(?:STAGE_DRAW_[A-Z_]+|kStageVideo[A-Za-z]+)\s*=\s*(\d+)')) {
+        foreach ($m in [regex]::Matches($stageSrc, '(?:STAGE_[A-Z_]+|kStageVideo[A-Za-z]+)\s*=\s*(\d+)')) {
             $v = [int]$m.Groups[1].Value
             if ($v -gt $lastStage) { $lastStage = $v }
         }
@@ -940,48 +946,82 @@ if (Test-Path -LiteralPath $mainPath) {
 #          esquina** — el sintoma que hay que evitar. Y el escalado en CPU de 8.523-13.766 us **cabe** en
 #          el presupuesto de 16.666 us. **Ante duda, lo probado.**
 #
-# La comprobacion: el framebuffer se fija con `resolution_to_wh()` (que fuerza 720p) y **no** se deriva
-# de `frame->width`. Y tiene que existir la traza que dice cuanto se escala.
+# La comprobacion, ACTUALIZADA EN LA v4.38 — y conviene explicar por que cambio:
+#
+#   Hasta la v4.37 esta comprobacion PROHIBIA derivar el framebuffer del frame, porque la v3.97 lo hizo
+#   y se revirtio en la v3.98 por falta de evidencia en consola: *"960x540 esta en la tabla pero nunca
+#   se ha probado"*, y *"si un buffer de 960x540 no se estira, el video se veria en una esquina"*.
+#
+#   **Esa evidencia ya existe, y la aporto el propio usuario en consola:** un framebuffer de 1280x720
+#   LLENA un panel de 1920x1080 sin recortarse y sin estiramiento apreciable. O sea: **`sceVideoOut`
+#   escala el framebuffer al panel en hardware**. El riesgo que justificaba la prohibicion ("se veria en
+#   una esquina") **esta descartado por observacion directa**.
+#
+#   Y mientras tanto, el coste de NO adaptarlo estaba medido y era la causa raiz de todo:
+#
+#       VIDEOOUT_SCALE_TIMING        dispatch_avg_us=30.819  dst=1920x1080
+#       STREAM_VIDEO_PHASES          scale_us=32.046
+#         -> present sobre presupuesto -> VIDEOOUT_RECREATE_REQUESTED_DEGRADACION
+#           -> restauracion a SDL -> 30 fps y delay durante 23 minutos
+#
+# POR ESO LA GUARDA NO SE ELIMINA: SE SUSTITUYE POR UNA MAS FUERTE. Ya no vigila *de donde sale* el
+# numero, sino **que el numero sea siempre uno de los YA PROBADOS y que nunca crezca**:
+#
+#   (A) el framebuffer se fija por configuracion con `resolution_to_wh()`      (igual que antes)
+#   (B) 960x540 (y su hermano 1280x720) estan DECLARADOS en `kSupported`      <-- NUEVO, lo importante
+#   (C) el adaptador NUNCA asigna un valor mayor que el configurado           (solo puede bajar)
+#   (D) el techo de 720p sigue en el renderizador                             (igual que antes)
+#   (E) existe la traza VIDEOOUT_FRAMEBUFFER_SIZE con `escalado_cpu=`         (igual que antes)
+#
+# (B) es la que impide que alguien adapte a un tamanio que `Initialize()` desconozca, y (C) la que
+# impide que el framebuffer crezca por encima de lo probado. Si alguna falla, la comprobacion falla.
 if (Test-Path -LiteralPath $mainPath) {
     $mainSrcF = [System.IO.File]::ReadAllText($mainPath)
     $mainCodeF = ($mainSrcF -split "`n" | Where-Object { $_ -notmatch '^\s*//' }) -join "`n"
 
-    # NO puede derivarse del frame (eso es la v3.97 revertida). El patron tiene que ser PRECISO, y ha
-    # hecho falta afinarlo tres veces, cada vez por un motivo distinto que conviene dejar escrito:
-    #
-    #   1. `-match 'fbW\s*=\s*frame->width'`  -> seguia PASANDO cuando la mutacion ANADIA esa linea
-    #      despues de la asignacion correcta, porque las lineas correctas seguian presentes.
-    #   2. `-match 'fbW\s*=\s*[^;]*frame->'`  -> DEMASIADO AMPLIO: `[^;]*` cruza el fin de linea y acaba
-    #      casando con el `frame->width` de una CADENA de log posterior. Falso positivo.
-    #   3. `(?m)^[^\r\n]*\bfbW\s*=\s*[^;\r\n]*frame->[^;\r\n]*;`  -> seguia dando FALSO POSITIVO, y la
-    #      causa es sutil: `\s*=\s*` casa con el PRIMER caracter de `==`, asi que la **comparacion**
-    #      `(fbW == frame->width && fbH == frame->height) ? "CERO" : "activo"` parecia una asignacion.
-    #
-    # La forma final exige que el `=` NO sea el inicio de `==` ni de `!=`/`<=`/`>=`, con una asercion
-    # negativa. Asi la comprobacion solo detecta una ASIGNACION real de fbW/fbH desde el frame.
-    $derivaDelFrame = ($mainCodeF -match '(?m)^[^\r\n]*\bfbW\s*=(?!=)\s*[^;\r\n]*frame->[^;\r\n]*;' -or
-                       $mainCodeF -match '(?m)^[^\r\n]*\bfbH\s*=(?!=)\s*[^;\r\n]*frame->[^;\r\n]*;')
-    # Tiene que fijarse por configuracion.
+    # (A) se fija por configuracion
     $fijaPorConfig  = ($mainCodeF -match 'int\s+fbW\s*=\s*1280\s*,\s*fbH\s*=\s*720' -and
                        $mainCodeF -match 'resolution_to_wh\s*\(\s*resolution\s*,\s*fbW\s*,\s*fbH\s*\)')
-    $marca          = ($mainCodeF -match 'VIDEOOUT_FRAMEBUFFER_SIZE')
+    # (B) los tamanios que el adaptador puede usar estan en la tabla del renderizador
+    #
+    # OJO CON LA REGEX, y esto se cazo con una mutacion que NO fallo: la primera version era
+    # `\{\s*960\s*,\s*540\s*\}`, y **casaba tambien con la linea COMENTADA** (`// {960, 540}`), asi que
+    # borrar la entrada de verdad seguia dando la comprobacion por buena. Ahora la entrada tiene que
+    # empezar con `{ ` justo despues de la indentacion (sin `//` delante), que es la forma real de la
+    # tabla, y se admite el comentario de linea posterior.
+    $voPath = Join-Path $root 'src\opennow\stream\PS4VideoOutRenderer.cpp'
+    $voSrc = if (Test-Path -LiteralPath $voPath) { [System.IO.File]::ReadAllText($voPath) } else { '' }
+    $tablaTiene960 = ($voSrc -match '(?m)^\s*\{\s*960,\s+540\s*\}')
+    $tablaTiene720 = ($voSrc -match '(?m)^\s*\{\s*1280,\s+720\s*\}')
+    # (C) el adaptador solo puede BAJAR: la condicion exige que el stream no sea mayor que lo configurado
+    $adaptadorSoloBaja = ($mainCodeF -match 'streamW\s*<=\s*fbW' -and $mainCodeF -match 'streamH\s*<=\s*fbH')
+    # (D) el techo sigue puesto
+    $techo720 = ($voSrc -match 'target_w\s*>\s*1280\s*\|\|\s*target_h\s*>\s*720')
+    # (E) la traza
+    $marca = ($mainCodeF -match 'VIDEOOUT_FRAMEBUFFER_SIZE' -and $mainCodeF -match 'escalado_cpu=')
 
-    if ($derivaDelFrame) {
-        Write-Host "  [FRAMEBUFFER] el framebuffer se deriva del frame otra vez" -ForegroundColor Red
-        Write-Host "                Ese es el cambio de la v3.97, REVERTIDO en la v3.98: 960x540 esta en la" -ForegroundColor Red
-        Write-Host "                tabla pero NUNCA se probo, y si no se estira el video se ve en una esquina." -ForegroundColor Red
-        $fail++
-    } elseif (-not $fijaPorConfig) {
+    if (-not $fijaPorConfig) {
         Write-Host "  [FRAMEBUFFER] no se fija por configuracion a 1280x720" -ForegroundColor Red
         Write-Host "                Hace falta: int fbW = 1280, fbH = 720; + resolution_to_wh(resolution, fbW, fbH)" -ForegroundColor Red
-        Write-Host "                1280x720 es el unico tamanio con evidencia de estabilidad (119 flips)." -ForegroundColor Red
+    } elseif (-not ($tablaTiene960 -and $tablaTiene720)) {
+        Write-Host "  [FRAMEBUFFER] el adaptador puede usar un tamanio que NO esta en kSupported" -ForegroundColor Red
+        Write-Host "                960x540 y 1280x720 tienen que seguir en la tabla del renderizador, o" -ForegroundColor Red
+        Write-Host "                Initialize() tendria que inventarse el tamano del buffer." -ForegroundColor Red
+        $fail++
+    } elseif (-not $adaptadorSoloBaja) {
+        Write-Host "  [FRAMEBUFFER] el adaptador no garantiza que el framebuffer solo BAJE" -ForegroundColor Red
+        Write-Host "                Tiene que exigir streamW <= fbW y streamH <= fbH. Sin eso el framebuffer" -ForegroundColor Red
+        Write-Host "                podria CRECER por encima de lo probado en consola." -ForegroundColor Red
+        $fail++
+    } elseif (-not $techo720) {
+        Write-Host "  [FRAMEBUFFER] falta el techo de 720p en el renderizador" -ForegroundColor Red
         $fail++
     } elseif (-not $marca) {
-        Write-Host "  [FRAMEBUFFER] falta la traza VIDEOOUT_FRAMEBUFFER_SIZE" -ForegroundColor Red
+        Write-Host "  [FRAMEBUFFER] falta la traza VIDEOOUT_FRAMEBUFFER_SIZE con escalado_cpu=" -ForegroundColor Red
         Write-Host "                Sin ella no se puede saber en el log cuanto se esta escalando." -ForegroundColor Red
         $fail++
     } else {
-        Write-Host "  [OK]    framebuffer fijo 1280x720 (el unico con evidencia: 119 flips)" -ForegroundColor Green
+        Write-Host "  [OK]    framebuffer: fijado por config, adaptado solo a tamanios de kSupported y solo a la baja" -ForegroundColor Green
     }
 }
 
@@ -1532,6 +1572,59 @@ if (Test-Path -LiteralPath $voutTexPath) {
 # la pantalla**, y ese escalado lo hace VideoOut **en hardware**. Con la fuente del stream a 720p, un
 # framebuffer de 1080p solo anadiria 4 veces mas pixeles que escribir.
 #
+
+
+# ==========================================================================================
+# LA RESTAURACION DE SDL NO PUEDE DESTRUIR LAS TEXTURAS CACHEADAS (v4.37)
+# ==========================================================================================
+# POR QUE ESTA COMPROBACION, y es la mas importante de esta version:
+#
+#   La sesion del 2026-10-06 (v4.36) se cerro con "Se produjo un error" despues de jugar un rato
+#   largo. La instrumentacion de la v4.35 lo localizo con nombre y numero:
+#
+#       VIDEOOUT_SDL_RESTORE_TEXT_CACHE_BEGIN   entradas=285
+#       VIDEOOUT_SDL_RESTORE_TEXT_CACHE_ITEM    text_cache_item=0
+#       <- y la app se cierra AHI, en la PRIMERA textura de 285
+#
+#   LA CAUSA ERA UN USE-AFTER-FREE: `releaseSdlForVideoOut()` llama a
+#   `SDL_QuitSubSystem(SDL_INIT_VIDEO)`, y eso **libera el renderizador de SDL y todas las
+#   texturas que le pertenecen**. Cuando despues `restoreSdlFromVideoOut()` creaba un renderizador
+#   nuevo y recorria `textCache`, esos `SDL_Texture*` ya eran **punteros a memoria liberada**, y
+#   `SDL_DestroyTexture` sobre ellos terminaba en el cierre.
+#
+#   EL ARREGLO ES **NO HACER** ALGO: no destruirlas, solo vaciar el mapa. Su dueno ya no existe, asi
+#   que no hay nada que liberar, y `getTextTexture()` las regenera solas contra el renderizador
+#   nuevo (hace `textCache.find(key)` y, si falta, `emplace()`).
+#
+# ESTA COMPROBACION EXISTE PARA QUE EL FALLO NO VUELVA EN SILENCIO: destruir lo que ya no existe
+# PARECE mas correcto que no hacer nada, y por eso hay que vigilarlo con una prueba.
+$mainSrcPath = Join-Path $root 'src\ps4\main.cpp'
+if (Test-Path -LiteralPath $mainSrcPath) {
+    $msrc = [System.IO.File]::ReadAllText($mainSrcPath)
+    $fn = [regex]::Match($msrc, 'static bool restoreSdlFromVideoOut\(\)\s*\{(?<body>.*?)\n\}', 'Singleline')
+    if (-not $fn.Success) {
+        Write-Host "  [FALTA]  no se encontro restoreSdlFromVideoOut() en main.cpp" -ForegroundColor Red
+        $fail++
+    } else {
+        # Se quitan los comentarios: la explicacion del arreglo MENCIONA SDL_DestroyTexture a
+        # proposito, y sin esto la comprobacion saltaria por su propio texto.
+        $bodyNoComments = [regex]::Replace($fn.Groups['body'].Value, '(?m)^\s*//.*$', '')
+        $destroyCount = ([regex]::Matches($bodyNoComments, 'SDL_DestroyTexture')).Count
+        if ($destroyCount -gt 0) {
+            Write-Host ("  [USE-AFTER-FREE] restoreSdlFromVideoOut() llama a SDL_DestroyTexture {0} vez/veces." -f $destroyCount) -ForegroundColor Red
+            Write-Host "          El renderizador VIEJO ya fue liberado por SDL_QuitSubSystem: esas texturas" -ForegroundColor Red
+            Write-Host "          son punteros a memoria liberada. Es el cierre de la v4.36." -ForegroundColor Red
+            Write-Host "          El arreglo es NO destruirlas: solo 'textCache.clear()'." -ForegroundColor Red
+            $fail++
+        } else {
+            Write-Host "  [OK]    restauracion de SDL: no destruye texturas cacheadas (solo vacia el mapa)" -ForegroundColor Green
+        }
+        if ($bodyNoComments -notmatch 'textCache\.clear\(\)') {
+            Write-Host "  [FALTA] restoreSdlFromVideoOut() no vacia textCache: se reutilizarian texturas viejas" -ForegroundColor Red
+            $fail++
+        }
+    }
+}
 
 
 if ($fail -gt 0) {

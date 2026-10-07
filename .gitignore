@@ -8,9 +8,7 @@
 /tools/
 
 # --- Salidas de compilacion -------------------------------------------------------------------------
-# El PKG SI se versiona (vive en build/), pero nada del arbol de compilacion intermedio.
-/build/*
-!/build/IV0000-GFNP00001_00-GFNPS4CLIENT0001.pkg
+# El PKG SI se versiona (vive en build/ y se adjunta al Release), pero el arbol intermedio no.
 /dist/
 *.o
 *.a
@@ -26,7 +24,6 @@ eboot.bin
 # --- Proyectos de terceros estudiados ---------------------------------------------------------------
 # NO se versionan: son cientos de MB y traen sus propias licencias (shadPS4 es GPL-2.0-or-later,
 # PS5PCEM es GPL-3.0-or-later, etc.). Incluirlos arrastraria esas obligaciones a este repositorio.
-# Se conservan localmente solo para lectura.
 /references/
 /PS5PCEM-main/
 /shadPS4-main/

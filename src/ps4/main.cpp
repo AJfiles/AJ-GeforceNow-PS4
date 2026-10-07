@@ -1027,10 +1027,49 @@ SDLVideoRenderer::SetRenderCanvas(g_ownCanvas);   // el escalador escribe en el 
     std::snprintf(winDetail, sizeof(winDetail), "width=%d height=%d format=SDL_SOFTWARE", W, H);
     opennow::LogAppLifecycleEvent("VIDEOOUT_HANDOFF_SDL_WINDOW_RECREATED", winDetail);
 
-    // Invalidate cached text textures because the SDL_Renderer handle changed
-    for(auto& item : textCache) {
-        if(item.second) SDL_DestroyTexture(item.second);
-    }
+    // Invalidate cached text textures because the SDL_Renderer handle changed.
+    //
+    // =============================================================================================
+    // ESTE ERA EL CIERRE. ARREGLADO EN LA v4.37. Y EL ARREGLO ES **NO HACER** ALGO.
+    // =============================================================================================
+    // QUE SE MIDIO (sesion del 2026-10-06, con la instrumentacion de la v4.35):
+    //
+    //     VIDEOOUT_SDL_RESTORE_TEXT_CACHE_BEGIN   entradas=285
+    //     VIDEOOUT_SDL_RESTORE_TEXT_CACHE_ITEM    text_cache_item=0
+    //     <- y la app se cierra AQUI. En la PRIMERA textura, de 285.
+    //
+    // LA CAUSA, y es un use-after-free:
+    //
+    //   `releaseSdlForVideoOut()` llama a **`SDL_QuitSubSystem(SDL_INIT_VIDEO)`**, y eso **libera el
+    //   renderizador de SDL y todas las texturas que le pertenecen**. Cuando mas tarde
+    //   `restoreSdlFromVideoOut()` crea un renderizador NUEVO y recorre `textCache`, esos 285
+    //   `SDL_Texture*` son **punteros a memoria ya liberada**.
+    //
+    //   `SDL_DestroyTexture` sobre un puntero liberado no es "lento": es tocar memoria que ya no
+    //   existe, y en la consola eso termina en el dialogo "Se produjo un error". **Coincide con el
+    //   sintoma exacto**: la imagen se queda negra (la ventana nueva se creo, pero no se llego a
+    //   dibujar porque la funcion murio antes de volver al bucle), y **las acciones del mando se
+    //   quedaron pulsadas** (los ultimos eventos enviados antes del cierre se quedaron sin su
+    //   "soltar", porque el hilo que los enviaba dejo de correr).
+    //
+    // EL ARREGLO: **no destruirlas.**
+    //
+    //   Es contraintuitivo, pero es lo correcto: **su dueño ya no existe**, asi que no hay nada que
+    //   liberar — `SDL_QuitSubSystem` ya lo hizo. Lo unico necesario es **vaciar el mapa** para que
+    //   `getTextTexture()` las regenere contra el renderizador nuevo. Y se regeneran solas: esa
+    //   funcion hace `textCache.find(key)` y, si no lo encuentra, crea la textura y la guarda con
+    //   `emplace()`. No hace falta nada mas.
+    //
+    // LO QUE **NO** SE HACE, y por que:
+    //
+    //   - **No** se llama a `SDL_DestroyTexture`: es el use-after-free que causaba el cierre.
+    //   - **No** se intenta conservar las texturas "por si valen": no valen, apuntan a un
+    //     renderizador destruido.
+    //   - **No** se libera el mapa a medias ni se recorre: se vacia entero, que es una operacion de
+    //     contenedor sin llamadas al driver.
+    //
+    // COSTE: ninguno apreciable. El primer frame tras la restauracion regenera las texturas que use,
+    // y solo las que use (el cache es por texto, no por pantalla).
     textCache.clear();
     stage("text_cache_cleared");
 
@@ -1237,6 +1276,10 @@ static void presentFrame() {
             // La copia se hace **fila a fila respetando el paso de cada superficie**, sin asumir que
             // coinciden: el lienzo propio es `ARGB8888` (4 bytes) y el de la ventana lo declara el
             // driver de otra forma. Se copian `min(fila, ancho*4)` bytes por fila.
+            // MARCA (v4.34): a partir de aqui se copian 1080 filas de 7680 bytes al framebuffer.
+            // Es el unico sitio de la ruta SDL que escribe mucho de golpe, y la ruta SDL murio en la
+            // sesion del 2026-10-06 sin ninguna marca propia que dijera donde.
+            opennow::SetCurrentStage(26 /* STAGE_SDL_COPY_BEGIN */);
             if(g_ownCanvas && g_ownCanvas->pixels) {
                 SDL_Surface* winSurf = SDL_GetWindowSurface(window);
                 if(winSurf && winSurf->pixels) {
@@ -1305,6 +1348,8 @@ static void presentFrame() {
                 }
             }
             const uint64_t t_update0 = getProcessTimeUs();
+            // MARCA (v4.34): el flip del driver, el otro sitio que escribe mucho de golpe.
+            opennow::SetCurrentStage(27 /* STAGE_SDL_UPDATE_WINDOW */);
             if(SDL_UpdateWindowSurface(window)!=0 && !updateFailureLogged) {
                 updateFailureLogged=true;
                 opennow::LogAppLifecycleEvent("SDL_VIDEOOUT_PRESENT_FAILED",SDL_GetError());
@@ -5349,7 +5394,23 @@ enum : int {
     STAGE_VIDEO_RENDER_SCALE   = 22,  // conversion de color / escalado
     STAGE_VIDEO_RENDER_UPLOAD  = 23,  // SDL_UpdateTexture (copia a la superficie interna)
     STAGE_VIDEO_RENDER_COPY    = 24,  // SDL_RenderCopy al lienzo
-    STAGE_VIDEO_RENDER_FALLBACK= 25   // ruta clasica de SDL (YUV)
+    STAGE_VIDEO_RENDER_FALLBACK= 25,  // ruta clasica de SDL (YUV)
+
+    // =========================================================================
+    // ETAPAS DE LA COPIA AL FRAMEBUFFER (v4.34)
+    // =========================================================================
+    // POR QUE SE ANADEN, y por que justo estas dos:
+    //
+    //   La sesion del 2026-10-06 con la v4.33 **murio con la ruta SDL activa**, y las dos etapas
+    //   anteriores (`DRAW_STREAM_BEGIN` y `DRAW_PRESENT`) son demasiado anchas: entre la una y la otra
+    //   caben la limpieza del lienzo, el callback del frame, el HUD y la presentacion entera. **Sin
+    //   marcas propias en esta ruta, `last_stage.txt` no puede decir nada mas preciso.**
+    //
+    //   La copia al framebuffer es la candidata con mas papeletas: son **1080 filas de `memcpy` de 7680
+    //   bytes** por frame. Medida en consola: `copia_lienzo_us=2315`, dentro del presupuesto, pero es el
+    //   unico sitio de esta ruta que escribe mucho de golpe.
+    STAGE_SDL_COPY_BEGIN       = 26,  // antes de copiar el lienzo a la superficie de la ventana
+    STAGE_SDL_UPDATE_WINDOW    = 27   // antes de SDL_UpdateWindowSurface (el flip del driver)
 };
 
 static void draw() {
@@ -5645,6 +5706,73 @@ static void draw() {
             // Subfase 2.2b: Handoff limpio SDL -> VideoOut al recibir el primer frame decodificado
             if(videoOutDirectActive && !activeStream->is_terminal() && frame && frame->width > 0 && frame->height > 0) {
                 if(!g_videoOutHandoffDone) {
+                    // =============================================================================
+                    // EL TRASPASO ESPERA A QUE LA RESOLUCION SE ESTABILICE (v4.39)
+                    // =============================================================================
+                    // POR QUE, y esto es lo que quedaba por resolver:
+                    //
+                    //   La v4.38 adapta el framebuffer al tamanio del PRIMER frame. En la sesion del
+                    //   2026-10-06 el primer frame llego a **1280x720**, el framebuffer se registro a
+                    //   720p con `escalado_cpu=CERO`, y la ruta directa dio **fps=64/69/71 con
+                    //   present_us=1.5-3.5 ms**. Iba perfecta.
+                    //
+                    //   **Y despues el servidor bajo a 960x540.** El framebuffer ya estaba registrado a
+                    //   720p (no se puede re-registrar con flips en vuelo), asi que el escalado en CPU
+                    //   volvio, medido:
+                    //
+                    //       VIDEOOUT_SCALE_BILINEAR_US  avg=17.085   (presupuesto: 16.666)
+                    //       VIDEOOUT_PRESENT_US         avg_us=17.801
+                    //       VIDEOOUT_PRESENT_FPS        fps=41
+                    //       -> VIDEOOUT_RECREATE_REQUESTED_DEGRADACION (5 ventanas)
+                    //         -> ruta SDL: **present_us=33.150, 30 fps**
+                    //
+                    //   **El fallo de fondo es que degradabamos a algo PEOR.** Medido en la misma
+                    //   sesion:
+                    //
+                    //       directa CON escalado : 17.801 us  -> 41 fps
+                    //       SDL (a donde vamos)  : 33.150 us  -> 30 fps
+                    //
+                    //   Cambiar a SDL **nunca puede mejorar** el coste: la ruta SDL compone sobre un
+                    //   lienzo de 1920x1080 (2,07 Mpx) mientras la directa escribe 1280x720 (0,92 Mpx) y
+                    //   en 1:1 ni escala. La decision de degradar se tomo sin comparar esos dos costes.
+                    //
+                    // LA SOLUCION: **no traspasar con el primer frame, sino cuando la resolucion lleve un
+                    // tiempo estable.** Asi el framebuffer se registra con el tamanio que el servidor va a
+                    // enviar de verdad, `needs_scaling` queda falso de forma sostenida, y la degradacion
+                    // **no llega a dispararse** porque el coste se queda en ~2 ms en vez de 17,8.
+                    //
+                    // EL UMBRAL: 90 frames. A 60 fps son 1,5 s de resolucion constante: mas que suficiente
+                    // para que el servidor se asiente (en la sesion medida tardo unos segundos en bajar a
+                    // 540p) y sigue siendo una espera imperceptible, porque hasta entonces se ve el stream
+                    // por la ruta SDL, que a resolucion nativa tambien da 60 fps.
+                    //
+                    // Es DETERMINISTA: no depende de relojes ni de heuristica de calidad, solo de contar
+                    // frames seguidos del mismo tamanio.
+                    static int s_handoffCandW = 0;
+                    static int s_handoffCandH = 0;
+                    static int s_handoffStableFrames = 0;
+                    const int kHandoffStableFrames = 90;
+
+                    if(frame->width != s_handoffCandW || frame->height != s_handoffCandH) {
+                        // Cambio de resolucion: la cuenta se reinicia con el tamanio nuevo.
+                        s_handoffCandW = frame->width;
+                        s_handoffCandH = frame->height;
+                        s_handoffStableFrames = 1;
+                        char candDetail[160];
+                        std::snprintf(candDetail, sizeof(candDetail),
+                                      "nueva=%dx%d cuenta_reiniciada=1 estable=0/%d",
+                                      frame->width, frame->height, kHandoffStableFrames);
+                        opennow::LogAppLifecycleEvent("VIDEOOUT_HANDOFF_ESPERANDO_ESTABLE", candDetail);
+                    } else if(s_handoffStableFrames < kHandoffStableFrames) {
+                        ++s_handoffStableFrames;
+                    }
+
+                    if(s_handoffStableFrames < kHandoffStableFrames) {
+                        // Todavia no se sabe cual es la resolucion de verdad: se sigue por la ruta SDL,
+                        // que a resolucion nativa va a 60 fps, y se sale SIN tocar el traspaso.
+                        return;
+                    }
+
                     char triggerDetail[96];
                     std::snprintf(triggerDetail, sizeof(triggerDetail), "width=%d height=%d format=%d",
                                   frame->width, frame->height, frame->format);
@@ -5802,15 +5930,89 @@ static void draw() {
                     // la sonda, mirar la pantalla, y con la respuesta (a) cambiar las dos lineas de abajo.
                     int fbW = 1280, fbH = 720;
                     resolution_to_wh(resolution, fbW, fbH);
+
+                    // =================================================================================
+                    // EL FRAMEBUFFER SE AJUSTA AL TAMANO DEL STREAM SI ESO ELIMINA EL ESCALADO (v4.38)
+                    // =================================================================================
+                    // POR QUE, y esto es la causa raiz medida de los 30 fps y de todo el efecto domino:
+                    //
+                    //   El servidor entrega **960x540** (medido en todas las sesiones). Con el framebuffer
+                    //   fijo en 1280x720, **cada frame se escala en la CPU**, y ese escalado cuesta:
+                    //
+                    //       VIDEOOUT_SCALE_BILINEAR_US   avg=13.000-20.000 us   (presupuesto: 16.666)
+                    //       VIDEOOUT_SCALE_TIMING        dispatch_avg_us=30.819  dst=1920x1080
+                    //       STREAM_VIDEO_PHASES          scale_us=32.046  conv_us=32.040
+                    //
+                    //   Y de ahi sale toda la cadena que hemos perseguido durante cinco versiones:
+                    //
+                    //       escalado caro -> `present_us` sobre presupuesto (por solo un 1,7 %)
+                    //         -> VIDEOOUT_RECREATE_REQUESTED_DEGRADACION (5 ventanas)
+                    //           -> se destruye VideoOut y se restaura SDL
+                    //             -> en la ruta SDL el stream se escala a 1920x1080 -> **30 fps** y delay
+                    //
+                    // LA CLAVE TECNICA, y esto **ya esta comprobado en consola por el usuario**:
+                    //
+                    //   Un framebuffer **1280x720 llena un panel de 1920x1080 sin recortarse y sin que el
+                    //   usuario note estiramiento**. Es decir: **`sceVideoOut` escala el framebuffer al
+                    //   panel en HARDWARE**. No hace falta que el framebuffer mida lo que el panel.
+                    //
+                    //   Eso convierte el escalado en una eleccion: la misma imagen se puede producir
+                    //   escalando en la CPU (caro, 13-32 ms, y dispara la degradacion) o **escalando en el
+                    //   hardware de VideoOut (coste CERO en CPU)**. Basta con registrar el framebuffer al
+                    //   tamanio del stream para que `needs_scaling` sea falso.
+                    //
+                    // POR QUE ES SEGURO, y no es la reactivacion ciega del modo AUTO que se retiro:
+                    //
+                    //   1. **`{960, 540}` YA ESTA en `kSupported`** (`PS4VideoOutRenderer.cpp:779`), asi
+                    //      que no hay que inventar un tamanio nuevo ni tocar la tabla.
+                    //   2. **Pasa el techo de 720p sin cambios**: el limite es `> 1280x720`, y 960x540
+                    //      esta por debajo. **Se sigue sin poder registrar 1080p.**
+                    //   3. **El framebuffer NO cambia durante la sesion.** Se elige UNA vez, aqui, con el
+                    //      primer frame, y `Initialize()` se llama una sola vez por sesion. El bucle de
+                    //      433 adopciones de la v3.26 no puede ocurrir: no hay ningun camino que vuelva a
+                    //      llamar a `Initialize()` con otro tamanio.
+                    //   4. **Solo puede BAJAR el coste.** Si el primer frame ya es 1280x720, `fbW/fbH` no
+                    //      cambian y el comportamiento es **exactamente el de antes**.
+                    //   5. **Nunca por encima del tamanio configurado**, asi que el trafico de memoria
+                    //      nunca sube: con 960x540 son 2,07 MB por frame a 60 Hz (124 MB/s), frente a los
+                    //      3,69 MB (210 MB/s) de 720p.
+                    //
+                    // EL CASO QUE NO CUBRE, y se dice en el log en vez de esconderse:
+                    //
+                    //   Si el servidor entrega 540p y DESPUES sube a 720p, el framebuffer ya esta
+                    //   registrado a 540p y esos frames de 720p **si** se escalaran en la CPU. Es una
+                    //   limitacion real (los buffers no se pueden re-registrar a mitad de sesion con
+                    //   flips en vuelo), y se registra como `escalado_cpu=activo` para que se vea.
+                    {
+                        const int streamW = frame->width;
+                        const int streamH = frame->height;
+                        if(streamW > 0 && streamH > 0 &&
+                           streamW <= fbW && streamH <= fbH &&
+                           (streamW != fbW || streamH != fbH)) {
+                            char adaptDetail[224];
+                            std::snprintf(adaptDetail, sizeof(adaptDetail),
+                                          "framebuffer_antes=%dx%d framebuffer_ahora=%dx%d "
+                                          "frame_servidor=%dx%d motivo=eliminar_escalado_en_cpu_"
+                                          "el_hardware_de_videoout_escala_al_panel",
+                                          fbW, fbH, streamW, streamH, streamW, streamH);
+                            opennow::LogAppLifecycleEvent("VIDEOOUT_FRAMEBUFFER_ADAPTADO", adaptDetail);
+                            fbW = streamW;
+                            fbH = streamH;
+                        }
+                    }
+
                     // Se registra el tamanio elegido y si va a haber escalado, para poder comprobarlo
                     // en el log sin ambiguedad.
                     {
                         char fbDetail[200];
                         std::snprintf(fbDetail, sizeof(fbDetail),
                                       "framebuffer=%dx%d frame_servidor=%dx%d escalado_cpu=%s "
-                                      "motivo=tamanio_verificado_estable_119_flips",
+                                      "motivo=%s",
                                       fbW, fbH, frame->width, frame->height,
-                                      (fbW == frame->width && fbH == frame->height) ? "CERO" : "activo");
+                                      (fbW == frame->width && fbH == frame->height) ? "CERO" : "activo",
+                                      (fbW == frame->width && fbH == frame->height)
+                                          ? "framebuffer_igual_al_stream"
+                                          : "framebuffer_distinto_del_stream");
                         opennow::LogAppLifecycleEvent("VIDEOOUT_FRAMEBUFFER_SIZE", fbDetail);
                     }
                     const bool initOk = opennow::PS4VideoOutRenderer::Initialize(fbW, fbH);
@@ -8589,7 +8791,48 @@ SDLVideoRenderer::SetRenderCanvas(g_ownCanvas);   // el escalador escribe en el 
         //
         // Se registra una linea por segundo, junto a `UI_LOOP_BUDGET`, para poder compararlas.
         const uint64_t t_draw_loop0 = getProcessTimeUs();
+        // =============================================================================================
+        // MARCAS DEL CICLO DEL BUCLE PRINCIPAL (v4.36)
+        // =============================================================================================
+        // POR QUE, y que se midio sin ellas:
+        //
+        //   En la sesion del 2026-10-06 (v4.35) el traspaso a la ruta directa salio **PERFECTO** y quedo
+        //   registrado entero:
+        //
+        //       VIDEOOUT_HANDOFF_COMPLETE          mode=direct_hardware_60fps
+        //       VIDEOOUT_HANDOFF_POST_UI_STATE     renderer=NULO lienzo=NULO ventana=NULA pagina=5
+        //       VIDEOOUT_HANDOFF_POST_FIRST_PRESENT ok=1 el_cierre_no_esta_en_Present
+        //
+        //   Es decir: **`Present()` corrio y volvio bien**, y el framebuffer era 1280x720 con escalado
+        //   CERO. Y a partir de ahi, el log se acaba.
+        //
+        //   La rama de la ruta directa **sale con `return`** de `draw()`, asi que el cierre esta
+        //   **DESPUES de que `draw()` retorne**: en el bucle, o al entrar en el en el ciclo siguiente.
+        //   Y el bucle **no tenia ni una marca propia**, asi que no se podia distinguir entre:
+        //
+        //     (a) `draw()` no vuelve            -> el cierre esta dentro de la ruta directa
+        //     (b) `draw()` vuelve y muere antes del `draw()` siguiente
+        //     (c) el ciclo se repite y muere despues, en el `Present()` siguiente
+        //
+        //   Estas tres marcas lo separan. Se emiten **solo cuando cambian de valor** (una vez por
+        //   transicion), no una por frame, para no inundar el log ni afectar al presupuesto.
+        {
+            static bool s_cycleBeforeLogged = false;
+            if(!s_cycleBeforeLogged) {
+                s_cycleBeforeLogged = true;
+                opennow::LogAppLifecycleEvent("LOOP_CYCLE_BEFORE_DRAW",
+                    "marca=v4.36 primera_vuelta_del_bucle");
+            }
+        }
         draw();
+        {
+            static bool s_drawReturned = false;
+            if(!s_drawReturned) {
+                s_drawReturned = true;
+                opennow::LogAppLifecycleEvent("LOOP_CYCLE_DRAW_RETURNED",
+                    "draw_volvio=1 el_cierre_NO_esta_dentro_de_draw");
+            }
+        }
         {
             const uint64_t t_draw_loop1 = getProcessTimeUs();
             static uint64_t s_drSum=0, s_drFrames=0, s_drLastLog=0;
@@ -8746,6 +8989,16 @@ SDLVideoRenderer::SetRenderCanvas(g_ownCanvas);   // el escalador escribe en el 
                     }
                 }
                 s_iterSumMs=0; s_drawSumMs=0; s_sleepSumMs=0; s_iterFrames=0;
+            }
+        }
+        // MARCA (v4.36): el ciclo llego al final. Si esta marca aparece y `LOOP_CYCLE_BEFORE_DRAW` no
+        // vuelve a salir despues, el cierre esta entre estas dos lineas (perf, sleep o eventos).
+        {
+            static bool s_cycleEndLogged = false;
+            if(!s_cycleEndLogged) {
+                s_cycleEndLogged = true;
+                opennow::LogAppLifecycleEvent("LOOP_CYCLE_END",
+                    "ciclo_cerrado=1 el_cierre_NO_esta_en_el_cierre_del_bucle");
             }
         }
         ++perfSampleFrames;

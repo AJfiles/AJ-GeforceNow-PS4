@@ -156,7 +156,65 @@ bool IsDurableLifecycleEvent(const char* event)
         return false;
 
     const std::string name(event);
+    // =================================================================================================
+    // LAS MARCAS DEL TRASPASO TIENEN QUE SER DURABLES (v4.33). ESTE FALLO NOS COSTO UNA PRUEBA.
+    // =================================================================================================
+    // POR QUE ESTAN AQUI, y por que faltaban:
+    //
+    //   En la v4.16 se anadieron tres marcas para localizar el cierre de la ruta directa:
+    //
+    //       VIDEOOUT_HANDOFF_COMPLETE           el traspaso termino
+    //       VIDEOOUT_HANDOFF_POST_UI_STATE      estado de renderer / lienzo / ventana
+    //       VIDEOOUT_HANDOFF_POST_FIRST_PRESENT `Present()` ya ha vuelto
+    //
+    //   **Pero no se anadieron a esta lista, asi que se quedaban en el bufer de stdio.** Y como el
+    //   cierre ocurre JUSTO DESPUES del traspaso, **las tres se perdian**: la traza detallada (que
+    //   escribe con `write()` directo, sin bufer) si registro `TRASPASO_COMPLETO`, y el log unificado
+    //   no tenia ni una linea a partir de ahi.
+    //
+    //   Resultado medido en la sesion del 2026-10-06: consta que el traspaso se completo y **no consta
+    //   si `Present()` llego a ejecutarse**. Esa es exactamente la pregunta que esas marcas existian
+    //   para responder, y no la pudieron responder porque no estaban en esta lista.
+    //
+    // Estas son de frecuencia CERO o UNA por sesion, asi que el `fsync` que implican no afecta al
+    // rendimiento. Las marcas por frame siguen SIN ser durables, y eso es a proposito.
     return name == "APP_START" || name == "APP_EXIT" ||
+           name == "VIDEOOUT_HANDOFF_COMPLETE" ||
+           name == "VIDEOOUT_HANDOFF_POST_UI_STATE" ||
+           name == "VIDEOOUT_HANDOFF_POST_FIRST_PRESENT" ||
+           name == "VIDEOOUT_HANDOFF_FAIL" ||
+           // =============================================================================
+           // RESTAURACION DE SDL TRAS VIDEOOUT (v4.35)
+           // =============================================================================
+           // La sesion del 2026-10-06 (v4.34) acabo con la pantalla en NEGRO: se recreo la ventana
+           // y el bucle de dibujado no volvio a correr. Estas marcas existian justo para localizar
+           // ese punto y **se quedaban en el bufer**, asi que no se pudo saber donde se paro. Se
+           // hacen durables por prefijo para no tener que enumerarlas una a una.
+           //
+           // Son de frecuencia CERO o UNA por sesion (salvo las de textura, que son una por textura
+           // cacheada y solo en el camino de recuperacion, que es excepcional).
+           name.rfind("VIDEOOUT_SDL_RESTORE_", 0) == 0 ||
+           name.rfind("VIDEOOUT_RECOVERY_", 0) == 0 ||
+           // =============================================================================
+           // MARCAS DEL CICLO DEL BUCLE (v4.36)
+           // =============================================================================
+           // El traspaso de la v4.35 salio PERFECTO (`POST_FIRST_PRESENT ok=1`) y el log se acababa
+           // justo despues. La rama directa sale con `return` de `draw()`, asi que el cierre esta
+           // DESPUES de que `draw()` retorne. Estas tres marcas separan "no vuelve de draw()" de
+           // "vuelve y muere en el ciclo". Son de frecuencia UNA (se emiten con bandera estatica),
+           // asi que el fsync no cuesta nada.
+           name == "LOOP_CYCLE_BEFORE_DRAW" ||
+           name == "LOOP_CYCLE_DRAW_RETURNED" ||
+           name == "LOOP_CYCLE_END" ||
+           // La espera a que la resolucion se estabilice antes del traspaso (v4.39). Es de frecuencia
+           // baja (una por cambio de resolucion) y hay que verla aunque la app muera: sin ella no se
+           // sabe con QUE resolucion se acabo traspasando.
+           name == "VIDEOOUT_HANDOFF_ESPERANDO_ESTABLE" ||
+           name == "VIDEOOUT_HANDOFF_TRIGGER_FRAME" ||
+           name == "VIDEOOUT_FRAMEBUFFER_ADAPTADO" ||
+           name == "VIDEOOUT_PRESENT_WATCHDOG" ||
+           name == "VIDEOOUT_QUARANTINED" ||
+           name == "VIDEOOUT_RECREATE_REQUESTED_DEGRADACION" ||
            name == "APP_INIT_FAILED" || name == "GAME_LAUNCH_REQUESTED" ||
            name == "GAME_LAUNCH_THREAD_CREATED" || name == "CLOUD_SESSION_CREATED" ||
            name == "CLOUD_SESSION_WAIT_BEGIN" || name == "CLOUD_SESSION_WAIT_COMPLETE" ||
@@ -275,7 +333,11 @@ void StartStageHeartbeat()
                     "VIDEO_RENDER_SCALE",   // 22
                     "VIDEO_RENDER_UPLOAD",  // 23
                     "VIDEO_RENDER_COPY",    // 24
-                    "VIDEO_RENDER_FALLBACK" // 25
+                    "VIDEO_RENDER_FALLBACK",// 25
+                    // Etapas de la copia al framebuffer (v4.34). OJO: van en la MISMA posicion que en
+                    // el enum de `main.cpp`, o este fichero mentiria mostrando el nombre de otra etapa.
+                    "SDL_COPY_BEGIN",       // 26
+                    "SDL_UPDATE_WINDOW"     // 27
                 };
                 const int stage = g_currentStage.load(std::memory_order_relaxed);
                 const char* name = (stage >= 0 && stage < static_cast<int>(sizeof(names)/sizeof(names[0])))

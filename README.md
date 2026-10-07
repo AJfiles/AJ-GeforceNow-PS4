@@ -3,7 +3,7 @@
 Cliente de GeForce NOW para PS4, homebrew. No es un navegador ni una web metida en un envoltorio: hace
 el recorrido entero del servicio por su cuenta.
 
-Versión 4.32. El PKG está en `build/`, listo para instalar.
+Versión 4.39. El PKG está en `build/` y adjunto en la página de [Releases](../../releases).
 
 ## Qué hace
 
@@ -106,7 +106,7 @@ No hace falta PSN.
 
 ## Instalación
 
-1. Copia `build/IV0000-GFNP00001_00-GFNPS4CLIENT0001.pkg` a un USB (exFAT o FAT32).
+1. Descarga `AJ-GeforceNowPS4-4.39.pkg` de la página de [Releases](../../releases).
 2. En la PS4, con GoldHEN activo: **Package Installer**.
 3. Instala y aparecerá **AJ GeForce NOW** en el menú.
 
@@ -255,7 +255,7 @@ scripts/                  Build y auditorías
 tests/                    Pruebas que corren en el PC, no en la consola
 cmake/                    Toolchain de CMake para PS4
 assets/                   Fuentes e imágenes
-build/                    El PKG
+build/                    El PKG compilado (tambien adjunto en Releases)
 ```
 
 Las dependencias que van incluidas en `src/third_party/`:
