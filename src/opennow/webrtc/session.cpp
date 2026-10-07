@@ -1,0 +1,617 @@
+#include "webrtc_session.hpp"
+#include "stream_diagnostics.hpp"
+#include "../stream_startup_diagnostics.hpp"
+#include "network_loop_policy.hpp"
+#include "startup_timeout_policy.hpp"
+#include "signaling_diagnostics.hpp"
+#include "stream/ffmpeg/AVFrameHolder.hpp"
+#ifdef __ORBIS__
+#include "../stream/PS4PigletVideoRenderer.hpp"
+#include "../ps4_logger.hpp"
+#else
+#include "borealis/core/logger.hpp"
+#endif
+#include "internal.hpp"
+#include "../ps4_secure_random.h"
+
+#include <algorithm>
+#include <chrono>
+#include <exception>
+#include <cstdint>
+#include <cstdio>
+#include <fstream>
+#include <stdexcept>
+#include <thread>
+
+#ifdef __SWITCH__
+#include <sys/stat.h>
+#endif
+
+using namespace opennow::webrtc::internal;
+
+
+namespace
+{
+
+constexpr const char* kNvdecActiveMarker =
+    "sdmc:/switch/SwitchNOW/nvdec_active.marker";
+
+static int s_remb_fail_count = 0;
+static int s_remb_ok_count = 0;
+
+bool ConsumeNvdecCrashMarker()
+{
+    std::ifstream marker(kNvdecActiveMarker, std::ios::binary);
+    const bool exists = marker.good();
+    marker.close();
+    if (exists)
+        std::remove(kNvdecActiveMarker);
+    return exists;
+}
+
+bool CreateNvdecCrashMarker()
+{
+#ifdef __SWITCH__
+    mkdir("sdmc:/switch", 0777);
+    mkdir("sdmc:/switch/SwitchNOW", 0777);
+#endif
+    std::ofstream marker(kNvdecActiveMarker, std::ios::binary | std::ios::trunc);
+    if (!marker.is_open())
+        return false;
+    marker << "NVDEC stream active; remove after clean shutdown\n";
+    marker.flush();
+    return marker.good();
+}
+
+opennow::StreamSettings LoadSessionSettings()
+{
+    opennow::WriteStreamStartupStage("loading_stream_settings");
+    auto settings = opennow::LoadStreamSettings();
+    opennow::LogAppLifecycleEvent("STREAM_SETTINGS_APPLIED",
+        ("resolution=" + std::to_string(settings.width) + "x" +
+         std::to_string(settings.height) + " fps=" + std::to_string(settings.fps) +
+         " bitrate_kbps=" + std::to_string(settings.bitrate_kbps) +
+         " audio=" + (settings.audio_enabled ? "on" : "off") +
+         " backend=" + settings.video_backend).c_str());
+    opennow::WriteStreamStartupStage("stream_settings_loaded");
+    return settings;
+}
+
+std::string BuildSignInUrl(std::string base_url, const std::string& peer_name, const std::string& session_id)
+{
+    const size_t query_pos = base_url.find('?');
+    if (query_pos != std::string::npos)
+        base_url.erase(query_pos);
+
+    if (StartsWith(base_url, "http://"))
+        base_url.replace(0, 4, "ws");
+    else if (StartsWith(base_url, "https://"))
+        base_url.replace(0, 5, "wss");
+
+    while (!base_url.empty() && base_url.back() == '/')
+        base_url.pop_back();
+
+    if (base_url.size() < 8 || base_url.substr(base_url.size() - 8) != "sign_in")
+        base_url += "/sign_in";
+
+    return base_url + "?peer_id=" + peer_name + "&version=2&peer_role=1&pairing_id=" + session_id;
+}
+
+std::string MakePeerName()
+{
+    opennow::WriteStreamStartupStage("peer_id_random_begin");
+    std::uint64_t random_value = 0;
+    const int random_rc = ps4_secure_random(&random_value, sizeof(random_value));
+    if (random_rc != 0)
+        throw std::runtime_error("PS4 could not generate a secure WebRTC peer identifier (Orbis code " +
+                                 std::to_string(random_rc) + ")");
+    opennow::WriteStreamStartupStage("peer_id_random_ready");
+    return "peer-" + std::to_string(random_value % 10000000000ULL);
+}
+
+} // namespace
+
+WebRtcSession::WebRtcSession(
+    const std::string& signaling_url,
+    const std::string& jwt_token,
+    const std::string& session_id,
+    const std::string& media_ip,
+    int media_port,
+    const std::vector<opennow::IceServerInfo>& ice_servers)
+    : signaling_url_(signaling_url),
+      jwt_token_(jwt_token),
+      session_id_(session_id),
+      media_ip_(media_ip),
+      media_port_(media_port),
+      ice_servers_(ice_servers),
+      settings_(LoadSessionSettings()),
+      peer_name_(MakePeerName()) {
+    opennow::WriteStreamStartupStage("stream_constructor_body");
+    // The PS4 app enables diagnostics in main() for crash triage. Do not let
+    // the persisted UI preference silently disable the stream flight recorder.
+    peer_connection_set_diagnostics_enabled(opennow::StreamDiagnosticsEnabled() ? 1 : 0);
+    opennow::WriteStreamStartupStage("renderer_initializing");
+#ifdef __ORBIS__
+    if (PS4PigletVideoRenderer::IsReady())
+        renderer_ = std::make_unique<PS4PigletVideoRenderer>();
+    else
+        renderer_ = std::make_unique<SDLVideoRenderer>();
+#else
+    renderer_ = std::make_unique<DKVideoRenderer>();
+#endif
+    opennow::WriteStreamStartupStage("renderer_ready");
+    opennow::WriteStreamStartupStage("audio_pipeline_initializing");
+    audio_ = std::make_unique<AudioPipeline>();
+    audio_->configure(settings_.audio_volume, settings_.audio_buffer_ms);
+    opennow::WriteStreamStartupStage("audio_pipeline_ready");
+
+    const bool previous_nvdec_crash = settings_.video_backend == "Auto" &&
+                                      ConsumeNvdecCrashMarker();
+    auto_safe_mode_used_ = previous_nvdec_crash;
+    const bool force_software = settings_.video_backend == "Software" ||
+                                previous_nvdec_crash;
+    opennow::WriteStreamStartupStage("video_decoder_setup_begin");
+    decoder_ = std::make_unique<FFmpegVideoDecoder>();
+    decoder_setup_result_ = decoder_->setup(
+        VIDEO_FORMAT_H264, settings_.width, settings_.height, settings_.fps, nullptr,
+        force_software ? VIDEO_DECODER_FORCE_SOFTWARE : VIDEO_DECODER_PREFER_HARDWARE);
+    opennow::WriteStreamStartupStage("video_decoder_first_setup_returned");
+
+    if (decoder_setup_result_ != 0 && !force_software) {
+        decoder_->cleanup();
+        decoder_ = std::make_unique<FFmpegVideoDecoder>();
+        decoder_setup_result_ = decoder_->setup(
+            VIDEO_FORMAT_H264, settings_.width, settings_.height, settings_.fps, nullptr,
+            VIDEO_DECODER_FORCE_SOFTWARE);
+        opennow::WriteStreamStartupStage("video_decoder_fallback_setup_returned");
+        decoder_fallback_used_ = decoder_setup_result_ == 0;
+    }
+
+    if (decoder_setup_result_ == 0 && decoder_->uses_hardware_frames())
+        video_backend_name_ = "NVDEC-NVTEGRA/Deko3D-zero-copy";
+    else if (decoder_setup_result_ == 0)
+#ifdef __ORBIS__
+        video_backend_name_ = "FFmpeg-SW/SDL-PS4";
+#else
+        video_backend_name_ = auto_safe_mode_used_
+            ? "FFmpeg-SW-3T/Deko3D-upload(crash-safe-mode)"
+            : decoder_fallback_used_
+            ? "FFmpeg-SW-3T/Deko3D-upload(auto-fallback)"
+            : "FFmpeg-SW-3T/Deko3D-upload";
+#endif
+    else
+        video_backend_name_ = "decoder-setup-failed";
+
+#ifdef __ORBIS__
+    opennow::LogAppLifecycleEvent("VIDEO_PIPELINE_READY",
+        ("decoder=" + video_backend_name_ +
+         " hardware_decode=" + (decoder_ && decoder_->uses_hardware_frames() ? "yes" : "no") +
+         " presenter=SDL-PS4").c_str());
+#endif
+
+    if (decoder_setup_result_ == 0 && decoder_->uses_hardware_frames())
+        nvdec_marker_owned_ = CreateNvdecCrashMarker();
+    opennow::WriteStreamStartupStage("stream_constructor_complete");
+}
+
+WebRtcSession::~WebRtcSession() {
+    stop();
+}
+
+void WebRtcSession::setup_peer_connection() {
+    PeerConfiguration config = {};
+    config.video_codec = CODEC_H264;
+    config.audio_codec = CODEC_OPUS;
+    config.datachannel = DATA_CHANNEL_STRING;
+    config.onvideopacket = on_video_packet_cb;
+    config.onaudiopacket = on_audio_packet_cb;
+    config.onrtpsenderreport = on_rtp_sender_report_cb;
+    config.user_data = this;
+
+    if (ice_servers_.empty()) {
+        ice_servers_.push_back({"stun:s1.stun.gamestream.nvidia.com:19308", "", ""});
+        ice_servers_.push_back({"stun:stun.l.google.com:19302", "", ""});
+        ice_servers_.push_back({"stun:stun1.l.google.com:19302", "", ""});
+    }
+
+    const size_t ice_count = std::min<size_t>(ice_servers_.size(), 5);
+    for (size_t i = 0; i < ice_count; ++i) {
+        config.ice_servers[i].urls = ice_servers_[i].url.c_str();
+        config.ice_servers[i].username =
+            ice_servers_[i].username.empty() ? nullptr : ice_servers_[i].username.c_str();
+        config.ice_servers[i].credential =
+            ice_servers_[i].credential.empty() ? nullptr : ice_servers_[i].credential.c_str();
+    }
+
+    pc_ = peer_connection_create(&config);
+    if (!pc_) {
+        brls::Logger::error("Failed to create PeerConnection");
+        return;
+    }
+
+    peer_connection_onicecandidate(pc_, on_ice_candidate_cb);
+    peer_connection_oniceconnectionstatechange(pc_, on_peer_state_change_cb);
+    peer_connection_ondatachannel(pc_, on_datachannel_message_cb, on_datachannel_open_cb, on_datachannel_close_cb);
+    // Note: libpeer requires patching or explicit callback for track data
+    // Assuming on_track or similar is available. For now, we stub it.
+    // peer_connection_ontrack(pc_, on_track_cb, this);
+}
+
+void WebRtcSession::start() {
+    stop_requested_.store(false, std::memory_order_release);
+    session_started_at_ = std::chrono::steady_clock::now();
+    ResetStreamTraceLog();
+    AppendStreamLog("SESSION start media=" + (media_ip_.empty() ? std::string("(auto)") : media_ip_) +
+                    ":" + std::to_string(media_port_) +
+                    " preset=" + settings_.label +
+                    " " + std::to_string(settings_.width) + "x" +
+                    std::to_string(settings_.height) + "@" +
+                    std::to_string(settings_.fps) +
+                    " bitrate=" + std::to_string(settings_.bitrate_kbps) +
+                    " iceServers=" + std::to_string(ice_servers_.size()));
+    AppendStreamLog("VIDEO backend=" + video_backend_name_ +
+                    " requested=" + settings_.video_backend +
+                    " fallback=" + std::to_string(decoder_fallback_used_ ? 1 : 0) +
+                    " crashSafeMode=" + std::to_string(auto_safe_mode_used_ ? 1 : 0) +
+                    " decoderSetup=" + std::to_string(decoder_setup_result_) +
+                    " expectedFormat=" +
+                    std::string(decoder_ && decoder_->uses_hardware_frames()
+                        ? "NVTEGRA" : "YUV420P/NV12"));
+    const bool input_codec_ok = InputEncodingSelfTest();
+    AppendStreamLog("INPUT codec_selftest ok=" + std::to_string(input_codec_ok ? 1 : 0));
+    AppendInputLog("SESSION start codecSelfTest=" + std::to_string(input_codec_ok ? 1 : 0) +
+                   " expectedController=xbox fixedReliableSid=0");
+    AppendTraceLog("SESSION start");
+    AppendTraceLog("peerName=" + peer_name_);
+    AppendTraceLog("mediaHint=" + (media_ip_.empty() ? std::string("(auto)") : media_ip_) +
+                   ":" + std::to_string(media_port_));
+    AppendTraceLog("preset=" + settings_.label + " resolution=" +
+                   std::to_string(settings_.width) + "x" + std::to_string(settings_.height) +
+                   " fps=" + std::to_string(settings_.fps) +
+                   " bitrateKbps=" + std::to_string(settings_.bitrate_kbps));
+    for (size_t i = 0; i < ice_servers_.size(); ++i) {
+        AppendTraceLog("iceServer[" + std::to_string(i) + "] url=" + ice_servers_[i].url +
+                       " user=" + (ice_servers_[i].username.empty() ? std::string("(empty)") : std::string("(set)")) +
+                       " credential=" + (ice_servers_[i].credential.empty() ? std::string("(empty)") : std::string("(set)")));
+    }
+    setup_peer_connection();
+    if (!pc_) {
+        current_state_ = "PeerConnection setup failed";
+        peer_terminal_kind_.store(
+            static_cast<int>(opennow::PeerTerminalKind::Failed),
+            std::memory_order_release);
+        peer_terminal_.store(true, std::memory_order_release);
+        AppendStreamLog("SESSION error peer_connection_setup_failed");
+        return;
+    }
+
+    const std::string sign_in_url = BuildSignInUrl(signaling_url_, peer_name_, session_id_);
+    signaling_client_ = std::make_unique<SignalingClient>(sign_in_url);
+    signaling_client_->set_on_message([this](const std::string& msg) {
+        const std::string summary = opennow::webrtc::CompactSignalingMessage(msg);
+        if (signaling_rx_count_ == 0)
+            opennow::WriteStreamStartupStage("signaling_first_message_handler_begin");
+        if (summary != "RX hb" && summary.rfind("RX ack=",0) != 0)
+            opennow::LogAppLifecycleEvent("SIGNAL_RX",summary.c_str());
+        handle_signaling_message(msg);
+        if (signaling_rx_count_ == 1)
+            opennow::WriteStreamStartupStage("signaling_first_message_handler_complete");
+    });
+
+    std::vector<std::string> headers;
+    headers.push_back("Origin: https://play.geforcenow.com");
+    headers.push_back("User-Agent: Mozilla/5.0 (Windows NT 10.0; Win64; x64) Chrome/131.0.0.0 Safari/537.36");
+    if (!session_id_.empty()) {
+        headers.push_back("Sec-WebSocket-Protocol: x-nv-sessionid." + session_id_);
+    }
+    signaling_client_->set_custom_headers(headers);
+
+    if (!signaling_client_->connect()) {
+        current_state_ = "WebSocket Connect Failed: " + signaling_client_->get_last_error();
+        peer_terminal_kind_.store(
+            static_cast<int>(opennow::PeerTerminalKind::Failed),
+            std::memory_order_release);
+        peer_terminal_.store(true, std::memory_order_release);
+        AppendStreamLog("SESSION error websocket_connect_failed " + signaling_client_->get_last_error());
+        signaling_ready_ = false;
+        return;
+    }
+    signaling_ready_ = true;
+    current_state_ = "Signaling connected, waiting for offer";
+    AppendStreamLog("SIGNAL connected");
+    send_peer_info();
+    send_heartbeat();
+    if (settings_.audio_enabled) {
+        const bool audio_started = audio_->start();
+        AppendStreamLog(std::string("AUDIO pipeline_start=") +
+                        (audio_started ? "ok" : "failed") + " " + audio_->debug_info());
+    }
+    start_decoder_worker();
+    start_network_worker();
+}
+
+
+void WebRtcSession::start_network_worker() {
+    if (network_running_.exchange(true))
+        return;
+
+    network_thread_ = std::thread(&WebRtcSession::network_loop, this);
+    AppendStreamLog("TRANSPORT worker_started");
+}
+
+void WebRtcSession::network_loop() {
+    try {
+    auto next_session_poll = std::chrono::steady_clock::now();
+    while (network_running_.load(std::memory_order_acquire)) {
+        const auto loop_started_at = std::chrono::steady_clock::now();
+        if (loop_started_at >= next_session_poll) {
+            // Keep WebRTC signaling, heartbeat and recovery work off the UI
+            // thread. poll() uses peer_mutex_, also used by the transport
+            // worker; running it here avoids making frame presentation wait
+            // for signaling and limits contention to this network worker.
+            poll();
+            next_session_poll = loop_started_at + std::chrono::milliseconds(16);
+
+            // ENVIO PERIODICO DE REMB (Receiver Estimated Maximum Bitrate).
+            //
+            // POR QUE: el cliente nunca le decia al servidor cuanto ancho de banda podia recibir.
+            // Sin esa estimacion, el codificador de NVIDIA adopta un valor conservador y baja la
+            // resolucion a 960x540 aunque la red este limpia (rtp gaps=0, reordered=0). REMB es la
+            // forma estandar (RFC 4585) de decir "puedo recibir X kbps".
+            //
+            // Se envia cada 1 s con el bitrate configurado por el usuario, que es una declaracion
+            // honesta de capacidad (la PS4 esta por cable y mide 91,8 Mbps de bajada).
+            {
+                static auto s_next_remb = std::chrono::steady_clock::now();
+                if (loop_started_at >= s_next_remb) {
+                    s_next_remb = loop_started_at + std::chrono::milliseconds(1000);
+                    std::lock_guard<std::recursive_mutex> lock(peer_mutex_);
+                    if (pc_ && signaling_ready_ && remote_description_set_) {
+                        const uint32_t remote_ssrc = peer_connection_remote_video_ssrc(pc_);
+                        if (remote_ssrc != 0) {
+                            const uint32_t target_kbps =
+                                static_cast<uint32_t>(settings_.bitrate_kbps > 0
+                                                          ? settings_.bitrate_kbps
+                                                          : 25000);
+                            const int rc = peer_connection_send_remb(pc_, remote_ssrc,
+                                                                    target_kbps * 1000);
+                            if (rc >= 0) {
+                                // Log de exito: el primero y luego uno de cada 120 (2 min).
+                                // En la 3.08 no habia rastro de REMB (ni exito ni fallo), asi
+                                // que no se podia saber si el envio ocurria o no.
+                                ++s_remb_ok_count;
+                                if (s_remb_ok_count == 1 || (s_remb_ok_count % 120) == 0) {
+                                    AppendStreamLog(std::string("REMB sent ok=") +
+                                                    std::to_string(s_remb_ok_count) +
+                                                    " kbps=" + std::to_string(target_kbps) +
+                                                    " ssrc=" + std::to_string(remote_ssrc));
+                                }
+                            } else if ((++s_remb_fail_count % 60) == 1) {
+                                AppendStreamLog(std::string("REMB send_failed rc=") +
+                                                std::to_string(rc));
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        if (!network_running_.load(std::memory_order_acquire))
+            break;
+
+        bool can_run = false;
+        int batch_size = 0;
+        {
+            std::lock_guard<std::recursive_mutex> lock(peer_mutex_);
+            can_run = !stop_requested_.load(std::memory_order_acquire) &&
+                      pc_ && signaling_ready_ && remote_description_set_ &&
+                      (remote_ice_count_ > 0 || manual_candidate_added_);
+            if (can_run) {
+                // Motion-heavy frames arrive as short UDP bursts. Drain a
+                // bounded batch while the peer lock is already held instead
+                // of paying one mutex hand-off and scheduler yield per packet.
+                constexpr int kMaximumDatagramsPerBatch = 24;
+                constexpr auto kMaximumBatchTime = std::chrono::microseconds(1000);
+                const auto batch_started_at = std::chrono::steady_clock::now();
+                for (int packet = 0; packet < kMaximumDatagramsPerBatch; ++packet) {
+                    if (peer_connection_loop(pc_) == 0)
+                        break;
+                    batch_size++;
+                    if (batch_size >= 8 &&
+                        std::chrono::steady_clock::now() - batch_started_at >=
+                            kMaximumBatchTime) {
+                        break;
+                    }
+                }
+                if (batch_size > 0) {
+                    transport_batches_.fetch_add(1, std::memory_order_relaxed);
+                    transport_datagrams_.fetch_add(
+                        static_cast<uint64_t>(batch_size), std::memory_order_relaxed);
+                    AtomicMax(transport_batch_high_water_, static_cast<size_t>(batch_size));
+                }
+            }
+        }
+
+        const int backoff_ms = opennow::network::LoopBackoffMilliseconds(can_run, batch_size);
+        if (backoff_ms > 0)
+            std::this_thread::sleep_for(std::chrono::milliseconds(backoff_ms));
+        else
+            std::this_thread::yield();
+    }
+
+    AppendStreamLog("TRANSPORT worker_stopped");
+    } catch (const std::exception& error) {
+        network_running_.store(false, std::memory_order_release);
+        stop_requested_.store(true, std::memory_order_release);
+        peer_terminal_kind_.store(
+            static_cast<int>(opennow::PeerTerminalKind::Failed),
+            std::memory_order_release);
+        peer_terminal_.store(true, std::memory_order_release);
+        decoder_running_.store(false, std::memory_order_release);
+        decoder_queue_cv_.notify_all();
+        try {
+            std::lock_guard<std::recursive_mutex> lock(peer_mutex_);
+            current_state_ = "Transport worker failed";
+        } catch (...) {}
+        try { AppendStreamLog(std::string("TRANSPORT worker_exception what=") + error.what()); }
+        catch (...) {}
+    } catch (...) {
+        network_running_.store(false, std::memory_order_release);
+        stop_requested_.store(true, std::memory_order_release);
+        peer_terminal_kind_.store(
+            static_cast<int>(opennow::PeerTerminalKind::Failed),
+            std::memory_order_release);
+        peer_terminal_.store(true, std::memory_order_release);
+        decoder_running_.store(false, std::memory_order_release);
+        decoder_queue_cv_.notify_all();
+        try {
+            std::lock_guard<std::recursive_mutex> lock(peer_mutex_);
+            current_state_ = "Transport worker failed";
+        } catch (...) {}
+        try { AppendStreamLog("TRANSPORT worker_exception unknown"); }
+        catch (...) {}
+    }
+}
+
+
+void WebRtcSession::poll() {
+    if (stop_requested_.load(std::memory_order_acquire))
+        return;
+
+    bool startup_timed_out = false;
+    opennow::webrtc::StartupTimeout startup_timeout = opennow::webrtc::StartupTimeout::None;
+    {
+        std::lock_guard<std::recursive_mutex> lock(peer_mutex_);
+        const auto now = std::chrono::steady_clock::now();
+        startup_timeout = opennow::webrtc::DetectStartupTimeout(
+            peer_completed_seen_, frames_decoded_.load() > 0,
+            std::chrono::duration_cast<std::chrono::milliseconds>(now - session_started_at_),
+            peer_completed_seen_
+                ? std::chrono::duration_cast<std::chrono::milliseconds>(now - peer_completed_at_)
+                : std::chrono::milliseconds(0));
+        if (startup_timeout != opennow::webrtc::StartupTimeout::None) {
+            current_state_ = startup_timeout == opennow::webrtc::StartupTimeout::Video
+                ? "Streaming video startup timed out" : "Streaming transport startup timed out";
+            peer_terminal_kind_.store(
+                static_cast<int>(opennow::PeerTerminalKind::Failed),
+                std::memory_order_release);
+            peer_terminal_.store(true, std::memory_order_release);
+            stop_requested_.store(true, std::memory_order_release);
+            startup_timed_out = true;
+        }
+    }
+    if (startup_timed_out) {
+        AppendStreamLog(startup_timeout == opennow::webrtc::StartupTimeout::Video
+            ? "SESSION error video_startup_timeout" : "SESSION error transport_startup_timeout");
+        request_stop();
+        return;
+    }
+
+    std::lock_guard<std::recursive_mutex> lock(peer_mutex_);
+
+    if (signaling_client_) {
+        signaling_client_->poll();
+    }
+
+    maybe_send_keepalive();
+
+    if (pc_ && signaling_ready_) {
+        if (!remote_description_set_) {
+            current_state_ = "Signaling connected, waiting for offer";
+            return;
+        }
+
+        maybe_add_manual_media_candidate();
+
+        if (remote_ice_count_ == 0 && !manual_candidate_added_) {
+            current_state_ = "Waiting for remote ICE";
+            return;
+        }
+
+        const PeerConnectionState state = peer_connection_get_state(pc_);
+        current_state_ = std::string("Peer ") + peer_connection_state_to_string(state);
+        if (state == PEER_CONNECTION_COMPLETED) {
+            bool keyframe_needed = false;
+            {
+                std::lock_guard<std::mutex> queue_lock(decoder_queue_mutex_);
+                keyframe_needed = decoder_recovery_.take_keyframe_request();
+            }
+            if (keyframe_needed)
+                request_keyframe("decoder_resync");
+            maybe_open_datachannel();
+            maybe_activate_input();
+            maybe_send_startup_control_messages();
+            maybe_send_input_heartbeat();
+            maybe_recover_rtp_damage();
+            maybe_recover_decode_stall();
+        }
+        if (state == PEER_CONNECTION_COMPLETED && !initial_keyframe_requested_) {
+            last_startup_keyframe_request_ = std::chrono::steady_clock::now();
+            request_keyframe("stream_start");
+            initial_keyframe_requested_ = true;
+        }
+        maybe_request_startup_keyframe_retry();
+        maybe_log_stream_diagnostics();
+    }
+}
+
+
+void WebRtcSession::request_stop() {
+    const bool already_requested =
+        stop_requested_.exchange(true, std::memory_order_acq_rel);
+
+    network_running_.store(false, std::memory_order_release);
+    decoder_running_.store(false, std::memory_order_release);
+    decoder_queue_cv_.notify_all();
+    if (!already_requested)
+        AppendInputLog("SESSION asynchronous_stop_requested");
+}
+
+void WebRtcSession::stop() {
+    request_stop();
+    if (network_thread_.joinable())
+        network_thread_.join();
+
+    if (audio_)
+        audio_->stop();
+
+    if (decoder_thread_.joinable())
+        decoder_thread_.join();
+
+    {
+        std::lock_guard<std::mutex> queue_lock(decoder_queue_mutex_);
+        clear_decoder_queue_locked();
+        decoder_buffer_pool_.clear();
+    }
+
+    std::lock_guard<std::recursive_mutex> lock(peer_mutex_);
+    if (!pc_ && !decoder_)
+        return;
+
+    log_stream_summary("stop");
+    AppendInputLog("SUMMARY attempts=" + std::to_string(gamepad_input_attempt_count_) +
+                   " blocked=" + std::to_string(gamepad_input_blocked_count_) +
+                   " reportsSent=" + std::to_string(gamepad_tx_count_) +
+                   " sendFailures=" + std::to_string(gamepad_send_failure_count_) +
+                   " mouseSent=" + std::to_string(mouse_tx_count_) +
+                   " sctpOpen=" + std::to_string(datachannel_opened_ ? 1 : 0) +
+                   " channelRequested=" + std::to_string(datachannel_open_requested_ ? 1 : 0) +
+                   " inputReady=" + std::to_string(input_ready_ ? 1 : 0) +
+                   " protocol=" + std::to_string(input_protocol_version_));
+    if (pc_) {
+        peer_connection_close(pc_);
+        peer_connection_destroy(pc_);
+        pc_ = nullptr;
+    }
+    // Zero-copy Deko3D mappings reference NVDEC-owned memory, so release all
+    // renderer mappings before destroying the decoder hardware frame pool.
+    if (renderer_)
+        renderer_.reset();
+    if (decoder_) {
+        decoder_->cleanup();
+        decoder_.reset();
+    }
+    if (nvdec_marker_owned_) {
+        std::remove(kNvdecActiveMarker);
+        nvdec_marker_owned_ = false;
+    }
+}

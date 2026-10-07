@@ -1,0 +1,157 @@
+#include "pm4_types.h"
+
+#include "pm4/sid.h"
+
+const char* pm4StrType(Pm4PacketType type) {
+	switch (type) {
+	case PM4_TYPE_0:
+		return "PM4_TYPE_0";
+	case PM4_TYPE_2:
+		return "PM4_TYPE_2";
+	case PM4_TYPE_3:
+		return "PM4_TYPE_3";
+	default:
+		return "Unknown";
+	}
+}
+
+const char* pm4StrOpcode(uint32_t opcode) {
+	switch (opcode) {
+	case PKT3_NOP:
+		return "nop";
+	case PKT3_SET_BASE:
+		return "set_base";
+	case PKT3_CLEAR_STATE:
+		return "clear_state";
+	case PKT3_INDEX_BUFFER_SIZE:
+		return "index_buffer_size";
+	case PKT3_DISPATCH_DIRECT:
+		return "dispatch_direct";
+	case PKT3_DISPATCH_INDIRECT:
+		return "dispatch_indirect";
+	case PKT3_ATOMIC_MEM:
+		return "atomic_mem";
+	case PKT3_OCCLUSION_QUERY:
+		return "occlusion_query";
+	case PKT3_SET_PREDICATION:
+		return "set_predication";
+	case PKT3_COND_EXEC:
+		return "cond_exec";
+	case PKT3_PRED_EXEC:
+		return "pred_exec";
+	case PKT3_DRAW_INDIRECT:
+		return "draw_indirect";
+	case PKT3_DRAW_INDEX_INDIRECT:
+		return "draw_index_indirect";
+	case PKT3_INDEX_BASE:
+		return "index_base";
+	case PKT3_DRAW_INDEX_2:
+		return "draw_index_2";
+	case PKT3_CONTEXT_CONTROL:
+		return "context_control";
+	case PKT3_INDEX_TYPE:
+		return "index_type";
+	case PKT3_DRAW_INDIRECT_MULTI:
+		return "draw_indirect_multi";
+	case PKT3_DRAW_INDEX_AUTO:
+		return "draw_index_auto";
+	case PKT3_DRAW_INDEX_IMMD:
+		return "draw_index_immd";
+	case PKT3_NUM_INSTANCES:
+		return "num_instances";
+	case PKT3_DRAW_INDEX_MULTI_AUTO:
+		return "draw_index_multi_auto";
+	case PKT3_INDIRECT_BUFFER_SI:
+		return "indirect_buffer_si";
+	case PKT3_INDIRECT_BUFFER_CONST:
+		return "indirect_buffer_const";
+	case PKT3_STRMOUT_BUFFER_UPDATE:
+		return "strmout_buffer_update";
+	case PKT3_DRAW_INDEX_OFFSET_2:
+		return "draw_index_offset_2";
+	case PKT3_WRITE_DATA:
+		return "write_data";
+	case PKT3_DRAW_INDEX_INDIRECT_MULTI:
+		return "draw_index_indirect_multi";
+	case PKT3_MEM_SEMAPHORE:
+		return "mem_semaphore";
+	case PKT3_MPEG_INDEX:
+		return "mpeg_index";
+	case PKT3_WAIT_REG_MEM:
+		return "wait_reg_mem";
+	case PKT3_MEM_WRITE:
+		return "mem_write";
+	case PKT3_INDIRECT_BUFFER_CIK:
+		return "indirect_buffer_cik";
+	case PKT3_COPY_DATA:
+		return "copy_data";
+	case PKT3_CP_DMA:
+		return "cp_dma";
+	case PKT3_PFP_SYNC_ME:
+		return "pfp_sync_me";
+	case PKT3_SURFACE_SYNC:
+		return "surface_sync";
+	case PKT3_ME_INITIALIZE:
+		return "me_initialize";
+	case PKT3_COND_WRITE:
+		return "cond_write";
+	case PKT3_EVENT_WRITE:
+		return "event_write";
+	case PKT3_EVENT_WRITE_EOP:
+		return "event_write_eop";
+	case PKT3_EVENT_WRITE_EOS:
+		return "event_write_eos";
+	case PKT3_RELEASE_MEM:
+		return "release_mem";
+	case PKT3_DMA_DATA:
+		return "dma_data";
+	case PKT3_DISPATCH_MESH_INDIRECT_MULTI:
+		return "dispatch_mesh_indirect_multi";
+	case PKT3_DISPATCH_TASKMESH_GFX:
+		return "dispatch_taskmesh_gfx";
+	case PKT3_CONTEXT_REG_RMW:
+		return "context_reg_rmw";
+	case PKT3_ONE_REG_WRITE:
+		return "one_reg_write";
+	case PKT3_ACQUIRE_MEM:
+		return "acquire_mem";
+	case PKT3_REWIND:
+		return "rewind";
+	case PKT3_LOAD_UCONFIG_REG:
+		return "load_uconfig_reg";
+	case PKT3_LOAD_SH_REG:
+		return "load_sh_reg";
+	case PKT3_LOAD_CONTEXT_REG:
+		return "load_context_reg";
+	case PKT3_LOAD_SH_REG_INDEX:
+		return "load_sh_reg_index";
+	case PKT3_SET_CONFIG_REG:
+		return "set_config_reg";
+	case PKT3_SET_CONTEXT_REG:
+		return "set_context_reg";
+	case PKT3_SET_SH_REG:
+		return "set_sh_reg";
+	case PKT3_SET_SH_REG_OFFSET:
+		return "set_sh_reg_offset";
+	case PKT3_SET_UCONFIG_REG:
+		return "set_uconfig_reg";
+	case PKT3_LOAD_CONST_RAM:
+		return "load_const_ram";
+	case PKT3_WRITE_CONST_RAM:
+		return "write_const_ram";
+	case PKT3_DUMP_CONST_RAM:
+		return "dump_const_ram";
+	case PKT3_INCREMENT_CE_COUNTER:
+		return "increment_ce_counter";
+	case PKT3_INCREMENT_DE_COUNTER:
+		return "increment_de_counter";
+	case PKT3_WAIT_ON_CE_COUNTER:
+		return "wait_on_ce_counter";
+	case PKT3_SET_SH_REG_INDEX:
+		return "set_sh_reg_index";
+	case PKT3_LOAD_CONTEXT_REG_INDEX:
+		return "load_context_reg_index";
+	default:
+		return "Unknown opcode";
+	}
+}

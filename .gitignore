@@ -1,0 +1,62 @@
+# =====================================================================================================
+# AJ GeForce NOW para PS4 — .gitignore
+# =====================================================================================================
+
+# --- Toolchain local --------------------------------------------------------------------------------
+# Se descarga aparte (OpenOrbis, LLVM-MinGW, CMake, PortableGit, .NET): son mas de 3 GB y cada uno
+# tiene su propia licencia. Ver la seccion "Compilar" del README.
+/tools/
+
+# --- Salidas de compilacion -------------------------------------------------------------------------
+# El PKG SI se versiona (vive en build/), pero nada del arbol de compilacion intermedio.
+/build/*
+!/build/IV0000-GFNP00001_00-GFNPS4CLIENT0001.pkg
+/dist/
+*.o
+*.a
+*.elf
+*.oelf
+*.d
+*.obj
+eboot.bin
+*.prx
+*.sprx
+*.self
+
+# --- Proyectos de terceros estudiados ---------------------------------------------------------------
+# NO se versionan: son cientos de MB y traen sus propias licencias (shadPS4 es GPL-2.0-or-later,
+# PS5PCEM es GPL-3.0-or-later, etc.). Incluirlos arrastraria esas obligaciones a este repositorio.
+# Se conservan localmente solo para lectura.
+/references/
+/PS5PCEM-main/
+/shadPS4-main/
+/ShadPKG-main/
+/playstation-decoder-main/
+/ps4-pkg-tools-main/
+/PS4-dec-master/
+/ps4debug-NG-master/
+/OrbisGL-master/
+/GPCS4-master/
+/SDL-PS4-master/
+/PkgToolBox-main/
+/_archivo-xcloud/
+
+# --- Registros de sesion de consola ------------------------------------------------------------------
+# Los logs de una consola concreta no son parte del proyecto: contienen identificadores de sesion,
+# direcciones de servidor y actividad de la cuenta.
+/logs/
+
+# --- Portapapeles / temporales -----------------------------------------------------------------------
+*.tmp
+*.bak
+*.user
+*.swp
+*~
+Thumbs.db
+desktop.ini
+.DS_Store
+
+# --- Editores ----------------------------------------------------------------------------------------
+.vscode/
+.idea/
+*.code-workspace

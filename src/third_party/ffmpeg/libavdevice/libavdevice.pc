@@ -1,0 +1,14 @@
+prefix=C:UsersADMINI~1DOCUME~1ChatGPTPS4APP~1/build/libpeer-ps4/dist
+exec_prefix=${prefix}
+libdir=C:UsersADMINI~1DOCUME~1ChatGPTPS4APP~1/build/libpeer-ps4/dist/lib
+includedir=C:UsersADMINI~1DOCUME~1ChatGPTPS4APP~1/build/libpeer-ps4/dist/include
+
+Name: libavdevice
+Description: FFmpeg device handling library
+Version: 63.1.102
+Requires: libavformat >= 63.1.102, libavcodec >= 63.1.102, libavutil >= 61.1.102
+Requires.private: 
+Conflicts:
+Libs: -L${libdir}  -lavdevice -lm
+Libs.private: 
+Cflags: -I${includedir}

@@ -1,0 +1,14 @@
+prefix=C:UsersADMINI~1DOCUME~1ChatGPTPS4APP~1/build/libpeer-ps4/dist
+exec_prefix=${prefix}
+libdir=C:UsersADMINI~1DOCUME~1ChatGPTPS4APP~1/build/libpeer-ps4/dist/lib
+includedir=C:UsersADMINI~1DOCUME~1ChatGPTPS4APP~1/build/libpeer-ps4/dist/include
+
+Name: libavformat
+Description: FFmpeg container format library
+Version: 63.1.102
+Requires: libavcodec >= 63.1.102, libavutil >= 61.1.102
+Requires.private: 
+Conflicts:
+Libs: -L${libdir}  -lavformat -lm
+Libs.private: 
+Cflags: -I${includedir}

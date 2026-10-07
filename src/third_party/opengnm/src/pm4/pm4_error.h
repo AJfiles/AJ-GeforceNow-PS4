@@ -1,0 +1,22 @@
+#ifndef _PM4_ERROR_H_
+#define _PM4_ERROR_H_
+
+typedef enum {
+	// not errors
+	PM4_ERR_OK = 0,
+	PM4_ERR_END_OF_CODE,
+
+	// errors
+	PM4_ERR_BUFFER_TOO_SMALL,
+	PM4_ERR_PKT_TOO_SMALL,
+	PM4_ERR_INVALID_ARG,
+	PM4_ERR_INVALID_TYPE,
+	PM4_ERR_INTERNAL_ERROR,
+	PM4_ERR_OVERFLOW,
+	PM4_ERR_SIZE_NOT_A_MULTIPLE_FOUR,
+	PM4_ERR_UNINITIALIZED_CONTEXT,
+} Pm4Error;
+
+const char* pm4StrError(Pm4Error err);
+
+#endif	// _PM4_ERROR_H_

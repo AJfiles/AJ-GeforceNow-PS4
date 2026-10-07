@@ -1,0 +1,14 @@
+prefix=C:UsersADMINI~1DOCUME~1ChatGPTPS4APP~1/build/libpeer-ps4/dist
+exec_prefix=${prefix}
+libdir=C:UsersADMINI~1DOCUME~1ChatGPTPS4APP~1/build/libpeer-ps4/dist/lib
+includedir=C:UsersADMINI~1DOCUME~1ChatGPTPS4APP~1/build/libpeer-ps4/dist/include
+
+Name: libavutil
+Description: FFmpeg utility library
+Version: 61.1.102
+Requires: 
+Requires.private: 
+Conflicts:
+Libs: -L${libdir}  -lavutil -lm -pthread
+Libs.private: 
+Cflags: -I${includedir}

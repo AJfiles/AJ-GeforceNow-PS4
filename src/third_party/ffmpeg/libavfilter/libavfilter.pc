@@ -1,0 +1,14 @@
+prefix=C:UsersADMINI~1DOCUME~1ChatGPTPS4APP~1/build/libpeer-ps4/dist
+exec_prefix=${prefix}
+libdir=C:UsersADMINI~1DOCUME~1ChatGPTPS4APP~1/build/libpeer-ps4/dist/lib
+includedir=C:UsersADMINI~1DOCUME~1ChatGPTPS4APP~1/build/libpeer-ps4/dist/include
+
+Name: libavfilter
+Description: FFmpeg audio/video filtering library
+Version: 12.1.102
+Requires: libavutil >= 61.1.102
+Requires.private: 
+Conflicts:
+Libs: -L${libdir}  -lavfilter -pthread -lm
+Libs.private: 
+Cflags: -I${includedir}
